@@ -120,9 +120,7 @@ fn correction_shrinks_with_sample_size() {
             "nu {nu}: {correction} is not about -1/(2 nu)"
         );
     }
-    assert!(
-        marginal_correction(99.0).unwrap().abs() > marginal_correction(9999.0).unwrap().abs()
-    );
+    assert!(marginal_correction(99.0).unwrap().abs() > marginal_correction(9999.0).unwrap().abs());
     // and the d-dimensional remainder vanishes as the sample grows
     assert!(correlation_correction(9999.0, 10).unwrap().abs() < 0.01);
     assert!(

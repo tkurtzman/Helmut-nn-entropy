@@ -205,8 +205,8 @@ mod tests {
         let nu = 5000.0;
         for d in 1..12 {
             let full = 0.5 * wishart_log_det_bias(nu, d).unwrap();
-            let parts =
-                d as f64 * marginal_correction(nu).unwrap() + correlation_correction(nu, d).unwrap();
+            let parts = d as f64 * marginal_correction(nu).unwrap()
+                + correlation_correction(nu, d).unwrap();
             assert!((full - parts).abs() < 1e-12, "d {d}");
         }
     }

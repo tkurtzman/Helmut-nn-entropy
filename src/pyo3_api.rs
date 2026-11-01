@@ -6,6 +6,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::basins::{BasinOptions, detect_basins as detect_basins_impl};
+use crate::bias::BiasCorrection;
 use crate::bat_library::{BondSet, CoordinateKind, CoordinateOptions, InternalCoordinates};
 use crate::quasi_harmonic::{MarginalEstimator, PeriodicCorrelation, QuasiHarmonicOptions};
 use crate::split::{
@@ -50,13 +51,15 @@ fn quasi_harmonic(
     metrics: &[CoordinateMetric],
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
     exact_constant: bool,
     theiler_window: usize,
 ) -> PyResult<HashMap<&'static str, f64>> {
     let entropy = crate::quasi_harmonic::estimate_quasi_harmonic_entropy(
         one_d_data,
         frames,
-        &quasi_harmonic_options(histogram_bins, periodic_correlation)?,
+        &quasi_harmonic_options(histogram_bins, periodic_correlation, bias, effective_frames)?,
         &entropy_options(metrics, exact_constant, theiler_window),
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -77,13 +80,15 @@ fn coordinate_quasi_harmonic(
     metrics: &[CoordinateMetric],
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
     exact_constant: bool,
     theiler_window: usize,
 ) -> PyResult<HashMap<&'static str, Vec<f64>>> {
     let entropy = crate::quasi_harmonic::estimate_coordinate_quasi_harmonic_entropy(
         one_d_data,
         frames,
-        &quasi_harmonic_options(histogram_bins, periodic_correlation)?,
+        &quasi_harmonic_options(histogram_bins, periodic_correlation, bias, effective_frames)?,
         &entropy_options(metrics, exact_constant, theiler_window),
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -99,8 +104,21 @@ fn coordinate_quasi_harmonic(
 fn quasi_harmonic_options(
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
 ) -> PyResult<QuasiHarmonicOptions> {
+    let bias = match bias {
+        "none" => BiasCorrection::None,
+        "wishart" => BiasCorrection::Wishart,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "bias must be \"none\" or \"wishart\", got {other:?}"
+            )));
+        }
+    };
     Ok(QuasiHarmonicOptions {
+        bias,
+        effective_frames,
         marginals: match histogram_bins {
             Some(bins) => MarginalEstimator::Histogram { bins },
             None => MarginalEstimator::NearestNeighbor,
@@ -257,6 +275,8 @@ impl SplitArguments {
         min_state_frames: usize,
         histogram_bins: Option<usize>,
         periodic_correlation: &str,
+        bias: &str,
+        effective_frames: Option<f64>,
         network_parents: usize,
     ) -> PyResult<Self> {
         let invalid = |name: &str, allowed: &str, got: &str| {
@@ -335,7 +355,7 @@ impl SplitArguments {
             soft: SoftArgument::extract(soft)?,
             soft_estimator,
             hard_estimator,
-            hard: quasi_harmonic_options(histogram_bins, periodic_correlation)?,
+            hard: quasi_harmonic_options(histogram_bins, periodic_correlation, bias, effective_frames)?,
             coupling: coupling.to_string(),
             soft_features,
             state_coordinates,
@@ -651,12 +671,14 @@ impl System {
     }
 
     /// QH and BQH entropy; see the module function of the same name.
-    #[pyo3(signature = (histogram_bins=None, periodic_correlation="complex", periodic=true, exact_constant=false, theiler_window=0))]
+    #[pyo3(signature = (histogram_bins=None, periodic_correlation="complex", bias="none", effective_frames=None, periodic=true, exact_constant=false, theiler_window=0))]
     fn estimate_quasi_harmonic_entropy(
         &self,
         py: Python<'_>,
         histogram_bins: Option<usize>,
         periodic_correlation: &str,
+        bias: &str,
+        effective_frames: Option<f64>,
         periodic: bool,
         exact_constant: bool,
         theiler_window: usize,
@@ -668,6 +690,8 @@ impl System {
                 &self.metrics_for(periodic),
                 histogram_bins,
                 periodic_correlation,
+                bias,
+                effective_frames,
                 exact_constant,
                 theiler_window,
             )
@@ -676,12 +700,14 @@ impl System {
 
     /// Each coordinate's share of the QH and BQH entropy; see the module
     /// function of the same name.
-    #[pyo3(signature = (histogram_bins=None, periodic_correlation="complex", periodic=true, exact_constant=false, theiler_window=0))]
+    #[pyo3(signature = (histogram_bins=None, periodic_correlation="complex", bias="none", effective_frames=None, periodic=true, exact_constant=false, theiler_window=0))]
     fn estimate_coordinate_quasi_harmonic_entropy(
         &self,
         py: Python<'_>,
         histogram_bins: Option<usize>,
         periodic_correlation: &str,
+        bias: &str,
+        effective_frames: Option<f64>,
         periodic: bool,
         exact_constant: bool,
         theiler_window: usize,
@@ -693,6 +719,8 @@ impl System {
                 &self.metrics_for(periodic),
                 histogram_bins,
                 periodic_correlation,
+                bias,
+                effective_frames,
                 exact_constant,
                 theiler_window,
             )
@@ -702,7 +730,7 @@ impl System {
     /// Split entropy; see the module function of the same name. `soft=None`
     /// uses the System's soft torsions.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (soft=None, soft_estimator="mie", mie_order=2, hard_estimator="qh", coupling="gaussian", soft_features="harmonics", harmonics=None, state_coordinates=None, state_labels=None, min_state_frames=300, histogram_bins=None, periodic_correlation="centered", periodic=true, exact_constant=false, theiler_window=0, per_coordinate=false, network_parents=5))]
+    #[pyo3(signature = (soft=None, soft_estimator="mie", mie_order=2, hard_estimator="qh", coupling="gaussian", soft_features="harmonics", harmonics=None, state_coordinates=None, state_labels=None, min_state_frames=300, histogram_bins=None, periodic_correlation="centered", bias="none", effective_frames=None, periodic=true, exact_constant=false, theiler_window=0, per_coordinate=false, network_parents=5))]
     fn estimate_split_entropy(
         &self,
         py: Python<'_>,
@@ -718,6 +746,8 @@ impl System {
         min_state_frames: usize,
         histogram_bins: Option<usize>,
         periodic_correlation: &str,
+        bias: &str,
+        effective_frames: Option<f64>,
         periodic: bool,
         exact_constant: bool,
         theiler_window: usize,
@@ -737,6 +767,8 @@ impl System {
             min_state_frames,
             histogram_bins,
             periodic_correlation,
+            bias,
+            effective_frames,
             network_parents,
         )?;
         let metrics = self.metrics_for(periodic);
@@ -887,7 +919,7 @@ fn estimate_coordinate_mutual_information(
 /// `periodic_correlation="centered"`.
 // Python keyword arguments, so the count is set by the public signature.
 #[allow(clippy::too_many_arguments)]
-#[pyfunction(signature = (data, periods=None, periodic=true, histogram_bins=None, periodic_correlation="complex", exact_constant=false, theiler_window=0))]
+#[pyfunction(signature = (data, periods=None, periodic=true, histogram_bins=None, periodic_correlation="complex", bias="none", effective_frames=None, exact_constant=false, theiler_window=0))]
 fn estimate_quasi_harmonic_entropy(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
@@ -895,6 +927,8 @@ fn estimate_quasi_harmonic_entropy(
     periodic: bool,
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
     exact_constant: bool,
     theiler_window: usize,
 ) -> PyResult<HashMap<&'static str, f64>> {
@@ -906,6 +940,8 @@ fn estimate_quasi_harmonic_entropy(
             &metrics,
             histogram_bins,
             periodic_correlation,
+            bias,
+            effective_frames,
             exact_constant,
             theiler_window,
         )
@@ -917,7 +953,7 @@ fn estimate_quasi_harmonic_entropy(
 /// matching total; the correlation term is shared out as 1/2 (log C)_ii.
 // Python keyword arguments, so the count is set by the public signature.
 #[allow(clippy::too_many_arguments)]
-#[pyfunction(signature = (data, periods=None, periodic=true, histogram_bins=None, periodic_correlation="complex", exact_constant=false, theiler_window=0))]
+#[pyfunction(signature = (data, periods=None, periodic=true, histogram_bins=None, periodic_correlation="complex", bias="none", effective_frames=None, exact_constant=false, theiler_window=0))]
 fn estimate_coordinate_quasi_harmonic_entropy(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
@@ -925,6 +961,8 @@ fn estimate_coordinate_quasi_harmonic_entropy(
     periodic: bool,
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
     exact_constant: bool,
     theiler_window: usize,
 ) -> PyResult<HashMap<&'static str, Vec<f64>>> {
@@ -936,6 +974,8 @@ fn estimate_coordinate_quasi_harmonic_entropy(
             &metrics,
             histogram_bins,
             periodic_correlation,
+            bias,
+            effective_frames,
             exact_constant,
             theiler_window,
         )
@@ -949,7 +989,7 @@ fn estimate_coordinate_quasi_harmonic_entropy(
 /// "detect", or a list of coordinate indices from 0; None means "topology"
 /// for a System and "detect" for an array.
 #[allow(clippy::too_many_arguments)]
-#[pyfunction(signature = (data, soft=None, soft_estimator="mie", mie_order=2, hard_estimator="qh", coupling="gaussian", soft_features="harmonics", harmonics=None, state_coordinates=None, state_labels=None, min_state_frames=300, histogram_bins=None, periodic_correlation="centered", periods=None, periodic=true, exact_constant=false, theiler_window=0, per_coordinate=false, network_parents=5))]
+#[pyfunction(signature = (data, soft=None, soft_estimator="mie", mie_order=2, hard_estimator="qh", coupling="gaussian", soft_features="harmonics", harmonics=None, state_coordinates=None, state_labels=None, min_state_frames=300, histogram_bins=None, periodic_correlation="centered", bias="none", effective_frames=None, periods=None, periodic=true, exact_constant=false, theiler_window=0, per_coordinate=false, network_parents=5))]
 fn estimate_split_entropy(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
@@ -965,6 +1005,8 @@ fn estimate_split_entropy(
     min_state_frames: usize,
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
     periods: Option<Vec<Option<f64>>>,
     periodic: bool,
     exact_constant: bool,
@@ -992,6 +1034,8 @@ fn estimate_split_entropy(
             min_state_frames,
             histogram_bins,
             periodic_correlation,
+            bias,
+            effective_frames,
             periodic,
             exact_constant,
             theiler_window,
@@ -1012,6 +1056,8 @@ fn estimate_split_entropy(
         min_state_frames,
         histogram_bins,
         periodic_correlation,
+        bias,
+        effective_frames,
         network_parents,
     )?;
     let (one_d_data, frames_end, metrics) = one_d_data_from_py(data, periods, periodic)?;

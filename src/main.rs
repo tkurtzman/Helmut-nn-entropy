@@ -518,6 +518,7 @@ fn main() {
                 traj_path.display()
             ))
         });
+
     let start = start.unwrap_or(0);
     let one_d_data = internal
         .columns(start, stride)

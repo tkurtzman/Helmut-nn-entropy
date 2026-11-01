@@ -6,8 +6,8 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::basins::{BasinOptions, detect_basins as detect_basins_impl};
-use crate::bias::BiasCorrection;
 use crate::bat_library::{BondSet, CoordinateKind, CoordinateOptions, InternalCoordinates};
+use crate::bias::BiasCorrection;
 use crate::quasi_harmonic::{MarginalEstimator, PeriodicCorrelation, QuasiHarmonicOptions};
 use crate::split::{
     Coupling, DEFAULT_HARMONICS, HardEstimator, LARGE_SOFT_SET, SoftEstimator, SoftFeatures,
@@ -355,7 +355,12 @@ impl SplitArguments {
             soft: SoftArgument::extract(soft)?,
             soft_estimator,
             hard_estimator,
-            hard: quasi_harmonic_options(histogram_bins, periodic_correlation, bias, effective_frames)?,
+            hard: quasi_harmonic_options(
+                histogram_bins,
+                periodic_correlation,
+                bias,
+                effective_frames,
+            )?,
             coupling: coupling.to_string(),
             soft_features,
             state_coordinates,
@@ -620,7 +625,7 @@ impl System {
 
     /// Mean over the selected frames of ln J, the internal part of the BAT
     /// Jacobian. Available only for a System loaded with `tree_bonds=True`
-    /// and without `torsions_only`.
+    /// (or `bonds='tree-unconstrained'`) and without `torsions_only`.
     #[getter]
     fn mean_log_jacobian(&self) -> PyResult<f64> {
         self.mean_log_jacobian.ok_or_else(|| {
@@ -807,7 +812,7 @@ impl System {
 
 // Python keyword arguments, so the count is set by the public signature.
 #[allow(clippy::too_many_arguments)]
-#[pyfunction(signature = (top_path, traj_path, start=None, stop=None, torsions_only=None, stride=None, tree_bonds=false, phase_angles=true))]
+#[pyfunction(signature = (top_path, traj_path, start=None, stop=None, torsions_only=None, stride=None, tree_bonds=false, phase_angles=true, bonds=None))]
 fn load_system(
     py: Python<'_>,
     top_path: &str,
@@ -818,13 +823,27 @@ fn load_system(
     stride: Option<usize>,
     tree_bonds: bool,
     phase_angles: bool,
+    bonds: Option<&str>,
 ) -> PyResult<System> {
+    let bonds = match bonds {
+        None if tree_bonds => BondSet::Tree,
+        None => BondSet::HeavyAtom,
+        Some(_) if tree_bonds => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "tree_bonds=True is shorthand for bonds='tree'; pass one or the other",
+            ));
+        }
+        Some("heavy") => BondSet::HeavyAtom,
+        Some("tree") => BondSet::Tree,
+        Some("tree-unconstrained") => BondSet::TreeUnconstrained,
+        Some(other) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "bonds must be 'heavy', 'tree' or 'tree-unconstrained', got {other:?}"
+            )));
+        }
+    };
     let options = CoordinateOptions {
-        bonds: if tree_bonds {
-            BondSet::Tree
-        } else {
-            BondSet::HeavyAtom
-        },
+        bonds,
         phase_angles,
         ..Default::default()
     };

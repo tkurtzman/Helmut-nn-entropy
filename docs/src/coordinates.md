@@ -10,6 +10,42 @@ By default, file-based calculations use every bond between two heavy atoms (ring
 
 **The BAT Jacobian** (`--jacobian`, `System.mean_log_jacobian`, `InternalCoordinates::log_jacobian`) is ln J = Σ 2 ln b + Σ ln sin θ over the tree's bonds and angles. Adding its mean to the BAT entropy gives the entropy of the internal motion measured in Cartesian coordinates. Bond lengths are in the trajectory's units (Å for Amber), so ln J depends on that choice, just as the bond-length entropies do. Phase angles do not change it.
 
+## Choosing the tree
+
+A molecule has many valid BAT trees. The joint entropy is the same on all of them — the
+phase-angle map is a shear with unit Jacobian — but a *sum of marginals* is not, and
+neither is a second-order truncation. On the alanine dipeptide, 88 trees spanning every
+root and four rules for picking the primary torsion put the truncated estimate anywhere in
+a 0.44 kcal/mol band, against 0.14 for the full multivariate form. The tree is therefore a
+stated convention, not an implementation detail.
+
+**Mass-ordered** (`--tree mass`, the default, `TreeRule::MassOrdered`) roots at the heaviest
+terminal atom and grows lightest-first, the construction MDAnalysis uses. It depends on
+nothing but the masses.
+
+**Canonical** (`--tree canonical`, `tree='canonical'`, `TreeRule::Canonical`) roots at the
+N-terminal backbone nitrogen and walks N -> CA -> C -> N, taking the grandparent's own
+parent as each torsion's reference atom. The four atoms of every backbone torsion are then
+the four it is named for:
+
+    C(i-1)-N-CA-C     phi
+    N-CA-C-N(i+1)     psi
+    CA(i-1)-C(i-1)-N-CA   omega
+    N-CA-CB-CG        chi1,  then CA-CB-CG-CD for chi2, outwards in IUPAC order
+
+Side-chain branches are ordered as IUPAC numbers them, so a threonine's chi1 runs through
+OG1 rather than the larger CG2 methyl, and a valine's through CG1. A molecule with no
+backbone — a ligand, a solvent molecule — is rooted at its highest-degree atom and the rest
+of the rule is unchanged, so the construction is deterministic for every system and never
+looks at the trajectory.
+
+Prefer it for proteins and peptides. The primary torsions are then the ones that already
+have names, so the soft set of the [split estimator](split.md) is exactly the named
+rotatable torsions, and a per-residue entropy means the same thing in two different
+proteins. It also removes the main source of per-atom instability: under an arbitrary tree
+a hydrogen is a primary-torsion partner in some trees and only a phase-angle partner in
+others, which moves a quarter share of a coordinate between atoms.
+
 ## Choosing the bond set
 
 Keep the default heavy-atom bonds for trajectories with constrained bonds to hydrogen (SHAKE, RATTLE, LINCS), which most production simulations use, or `--bonds tree-unconstrained` when the Jacobian is wanted as well. Use tree bonds only for unconstrained simulations.

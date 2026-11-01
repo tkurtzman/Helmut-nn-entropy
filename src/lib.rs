@@ -115,6 +115,7 @@ use rayon::prelude::*;
 use std::num::NonZero;
 
 pub mod basins;
+pub mod bias;
 pub mod bat_library;
 // Reproduces the original Python implementation bit for bit, for comparison
 // with historical results. A developer tool, kept out of the user docs; the

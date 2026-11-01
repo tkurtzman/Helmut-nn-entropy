@@ -80,6 +80,7 @@ fn estimates(state: &State) -> Result<Vec<f64>, String> {
         let settings = QuasiHarmonicOptions {
             marginals,
             periodic,
+            ..Default::default()
         };
         estimate_quasi_harmonic_entropy(&state.data, frames, &settings, &options)
     };

@@ -1,7 +1,9 @@
 use std::env;
 use std::path::Path;
 
-use molentropy::bat_library::{BondSet, CoordinateOptions, Geometry, InternalCoordinates};
+use molentropy::bat_library::{
+    BondSet, CoordinateOptions, Geometry, InternalCoordinates, TreeRule,
+};
 use molentropy::bias::BiasCorrection;
 use molentropy::legacy::legacy_entropy;
 use molentropy::quasi_harmonic::{
@@ -117,7 +119,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         fail(format!(
-            "Usage: {} <path_to_parm7> <path_to_nc> [--torsions-only] [--no-periodic] [--exact-constant] [--start N] [--stop N] [--stride N] [--mie-order 1|2|3|4] [--theiler-window W] [--tree-bonds] [--bonds heavy|tree|tree-unconstrained] [--no-phase-angles] [--jacobian] [--estimator nn|qh|bqh|split] [--histogram-bins N] [--periodic-correlation complex|centered] [--per-coordinate] [--mutual-information] [--soft topology|detect|LIST] [--soft-estimator mie|mist|network|joint] [--network-parents N] [--hard-estimator qh|bqh|qh-mie1|qh-mie2] [--coupling gaussian|states|none] [--soft-features complex|cossin|harmonics] [--harmonics N] [--state-torsions auto|LIST] [--min-state-frames N]",
+            "Usage: {} <path_to_parm7> <path_to_nc> [--torsions-only] [--no-periodic] [--exact-constant] [--start N] [--stop N] [--stride N] [--mie-order 1|2|3|4] [--theiler-window W] [--tree-bonds] [--bonds heavy|tree|tree-unconstrained] [--tree mass|canonical] [--no-phase-angles] [--jacobian] [--estimator nn|qh|bqh|split] [--histogram-bins N] [--periodic-correlation complex|centered] [--per-coordinate] [--mutual-information] [--soft topology|detect|LIST] [--soft-estimator mie|mist|network|joint] [--network-parents N] [--hard-estimator qh|bqh|qh-mie1|qh-mie2] [--coupling gaussian|states|none] [--soft-features complex|cossin|harmonics] [--harmonics N] [--state-torsions auto|LIST] [--min-state-frames N]",
             args[0]
         ));
     }
@@ -129,6 +131,7 @@ fn main() {
     let mut phase_angles: Option<bool> = None;
     let mut tree_bonds = false;
     let mut bond_set: Option<BondSet> = None;
+    let mut tree_rule: Option<TreeRule> = None;
     let mut jacobian = false;
     let mut no_periodic = false;
     let mut exact_constant = false;
@@ -181,6 +184,17 @@ fn main() {
                         ("heavy", BondSet::HeavyAtom),
                         ("tree", BondSet::Tree),
                         ("tree-unconstrained", BondSet::TreeUnconstrained),
+                    ],
+                ));
+                i += 2;
+            }
+            "--tree" => {
+                tree_rule = Some(flag_choice(
+                    &args,
+                    i,
+                    &[
+                        ("mass", TreeRule::MassOrdered),
+                        ("canonical", TreeRule::Canonical),
                     ],
                 ));
                 i += 2;
@@ -465,6 +479,7 @@ fn main() {
             ),
             (tree_bonds, "--tree-bonds"),
             (bond_set.is_some(), "--bonds"),
+            (tree_rule.is_some(), "--tree"),
             (phase_angles == Some(true), "--phase-angles"),
             (jacobian, "--jacobian"),
             (per_coordinate, "--per-coordinate"),
@@ -479,6 +494,7 @@ fn main() {
 
     let coordinate_options = CoordinateOptions {
         bonds,
+        tree: tree_rule.unwrap_or_default(),
         // The original Python implementation used the raw torsions.
         phase_angles: phase_angles.unwrap_or(!legacy),
         geometry: if legacy {
@@ -502,7 +518,6 @@ fn main() {
                 traj_path.display()
             ))
         });
-
     let start = start.unwrap_or(0);
     let one_d_data = internal
         .columns(start, stride)

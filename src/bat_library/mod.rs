@@ -737,13 +737,25 @@ fn build_bat_list(
     let mut bat_list = Vec::new();
 
     let bat = build_bat(fragment, adjacency, masses)?;
-    if bonds == BondSet::Tree {
+    if bonds.is_tree() {
         // The two root bonds, then the bond that places each later atom, in
-        // the same order as the angles and torsions below.
-        bat_list.push(vec![bat.root[0], bat.root[1]]);
-        bat_list.push(vec![bat.root[1], bat.root[2]]);
+        // the same order as the angles and torsions below. Under
+        // `TreeUnconstrained` a bond to hydrogen is held fixed by the
+        // simulation and is not a coordinate; the tree itself, and so every
+        // angle and torsion, is unchanged.
+        let keep = |a: usize, b: usize| {
+            bonds == BondSet::Tree || !(hydrogens.contains(&a) || hydrogens.contains(&b))
+        };
+        if keep(bat.root[0], bat.root[1]) {
+            bat_list.push(vec![bat.root[0], bat.root[1]]);
+        }
+        if keep(bat.root[1], bat.root[2]) {
+            bat_list.push(vec![bat.root[1], bat.root[2]]);
+        }
         for t in bat.torsions.iter() {
-            bat_list.push(vec![t[0], t[1]]);
+            if keep(t[0], t[1]) {
+                bat_list.push(vec![t[0], t[1]]);
+            }
         }
     } else {
         let fragment_set: HashSet<usize> = fragment.iter().copied().collect();
@@ -788,6 +800,26 @@ pub enum BondSet {
     /// With the angles and torsions this is a non-redundant set of 3N - 6
     /// coordinates per molecule, the set the BAT Jacobian is defined for.
     Tree,
+    /// The bonds of the BAT spanning tree, minus the bonds to hydrogen, which
+    /// SHAKE and the other constraint algorithms hold at a fixed length.
+    ///
+    /// The spanning tree is built exactly as for [`BondSet::Tree`], so the
+    /// angles and torsions are the same and the set is still non-redundant;
+    /// only the constrained bond lengths are left out. This is the right set
+    /// for a trajectory run with constrained X-H bonds: those lengths carry
+    /// no entropy, and keeping them adds the entropy of the constraint
+    /// algorithm's numerical noise, a few tenths of k_B per bond. It differs
+    /// from [`BondSet::HeavyAtom`], which also drops the ring-closure bonds
+    /// and does not follow the tree.
+    TreeUnconstrained,
+}
+
+impl BondSet {
+    /// Whether the bonds are taken from the BAT spanning tree, so that the
+    /// coordinates are non-redundant and the Jacobian is defined.
+    pub fn is_tree(self) -> bool {
+        matches!(self, Self::Tree | Self::TreeUnconstrained)
+    }
 }
 
 /// How angles and torsions are evaluated from positions.
@@ -1258,11 +1290,15 @@ impl InternalCoordinates {
     /// entropy gives the entropy of the internal motion in Cartesian
     /// coordinates. Bond lengths are in the trajectory's units.
     ///
-    /// Defined only for the full non-redundant set: `BondSet::Tree`, without
-    /// `torsions_only`. Phase angles do not change it.
+    /// Defined only for a non-redundant tree set, `BondSet::Tree` or
+    /// `BondSet::TreeUnconstrained`, without `torsions_only`. Phase angles do
+    /// not change it. Under `TreeUnconstrained` the constrained bonds are not
+    /// coordinates, so their `2 ln b` terms are left out; each is a constant
+    /// of the molecule and cancels in a difference between two ensembles of
+    /// it.
     pub fn log_jacobian(&self) -> Result<Vec<f64>> {
-        if self.options.bonds != BondSet::Tree {
-            return Err("the BAT Jacobian needs the tree bond set".into());
+        if !self.options.bonds.is_tree() {
+            return Err("the BAT Jacobian needs a tree bond set".into());
         }
         if self.torsions_only {
             return Err("the BAT Jacobian needs bonds and angles, not torsions only".into());

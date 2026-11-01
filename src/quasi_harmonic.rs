@@ -77,10 +77,7 @@ pub struct QuasiHarmonicOptions {
 
 /// The degrees of freedom the bias correction is evaluated at.
 fn degrees_of_freedom(quasi_harmonic: &QuasiHarmonicOptions, frames_end: usize) -> f64 {
-    quasi_harmonic
-        .effective_frames
-        .unwrap_or(frames_end as f64)
-        - 1.0
+    quasi_harmonic.effective_frames.unwrap_or(frames_end as f64) - 1.0
 }
 
 /// QH and BQH totals with the terms they are built from, all in units of k_B.

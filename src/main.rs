@@ -117,7 +117,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         fail(format!(
-            "Usage: {} <path_to_parm7> <path_to_nc> [--torsions-only] [--no-periodic] [--exact-constant] [--start N] [--stop N] [--stride N] [--mie-order 1|2|3|4] [--theiler-window W] [--tree-bonds] [--no-phase-angles] [--jacobian] [--estimator nn|qh|bqh|split] [--histogram-bins N] [--periodic-correlation complex|centered] [--per-coordinate] [--mutual-information] [--soft topology|detect|LIST] [--soft-estimator mie|mist|network|joint] [--network-parents N] [--hard-estimator qh|bqh|qh-mie1|qh-mie2] [--coupling gaussian|states|none] [--soft-features complex|cossin|harmonics] [--harmonics N] [--state-torsions auto|LIST] [--min-state-frames N]",
+            "Usage: {} <path_to_parm7> <path_to_nc> [--torsions-only] [--no-periodic] [--exact-constant] [--start N] [--stop N] [--stride N] [--mie-order 1|2|3|4] [--theiler-window W] [--tree-bonds] [--bonds heavy|tree|tree-unconstrained] [--no-phase-angles] [--jacobian] [--estimator nn|qh|bqh|split] [--histogram-bins N] [--periodic-correlation complex|centered] [--per-coordinate] [--mutual-information] [--soft topology|detect|LIST] [--soft-estimator mie|mist|network|joint] [--network-parents N] [--hard-estimator qh|bqh|qh-mie1|qh-mie2] [--coupling gaussian|states|none] [--soft-features complex|cossin|harmonics] [--harmonics N] [--state-torsions auto|LIST] [--min-state-frames N]",
             args[0]
         ));
     }
@@ -128,6 +128,7 @@ fn main() {
     // None until a flag sets it: phase angles are on unless --legacy.
     let mut phase_angles: Option<bool> = None;
     let mut tree_bonds = false;
+    let mut bond_set: Option<BondSet> = None;
     let mut jacobian = false;
     let mut no_periodic = false;
     let mut exact_constant = false;
@@ -171,6 +172,18 @@ fn main() {
             "--tree-bonds" => {
                 tree_bonds = true;
                 i += 1;
+            }
+            "--bonds" => {
+                bond_set = Some(flag_choice(
+                    &args,
+                    i,
+                    &[
+                        ("heavy", BondSet::HeavyAtom),
+                        ("tree", BondSet::Tree),
+                        ("tree-unconstrained", BondSet::TreeUnconstrained),
+                    ],
+                ));
+                i += 2;
             }
             "--jacobian" => {
                 jacobian = true;
@@ -357,8 +370,18 @@ fn main() {
     if stride == 0 {
         fail("--stride must be at least 1");
     }
-    if jacobian && (!tree_bonds || torsions_only) {
-        fail("--jacobian requires --tree-bonds and cannot be combined with --torsions-only");
+    if tree_bonds && bond_set.is_some() {
+        fail("--tree-bonds is shorthand for --bonds tree; pass one or the other");
+    }
+    let bonds = bond_set.unwrap_or(if tree_bonds {
+        BondSet::Tree
+    } else {
+        BondSet::HeavyAtom
+    });
+    if jacobian && (!bonds.is_tree() || torsions_only) {
+        fail(
+            "--jacobian requires --tree-bonds (or --bonds tree-unconstrained) and cannot be combined with --torsions-only",
+        );
     }
 
     let split = estimator == Estimator::Split;
@@ -441,6 +464,7 @@ fn main() {
                 "--estimator other than nn",
             ),
             (tree_bonds, "--tree-bonds"),
+            (bond_set.is_some(), "--bonds"),
             (phase_angles == Some(true), "--phase-angles"),
             (jacobian, "--jacobian"),
             (per_coordinate, "--per-coordinate"),
@@ -454,11 +478,7 @@ fn main() {
     }
 
     let coordinate_options = CoordinateOptions {
-        bonds: if tree_bonds {
-            BondSet::Tree
-        } else {
-            BondSet::HeavyAtom
-        },
+        bonds,
         // The original Python implementation used the raw torsions.
         phase_angles: phase_angles.unwrap_or(!legacy),
         geometry: if legacy {
@@ -776,7 +796,7 @@ fn main() {
         // Over the same frames the entropy used.
         let log_jacobian = internal
             .log_jacobian()
-            .expect("--tree-bonds without --torsions-only was checked above");
+            .expect("a tree bond set without --torsions-only was checked above");
         let mean =
             log_jacobian.iter().skip(start).step_by(stride).sum::<f64>() / used_frames as f64;
         println!("Mean ln J = {}", mean);

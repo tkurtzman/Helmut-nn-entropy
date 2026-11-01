@@ -6,7 +6,9 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::basins::{BasinOptions, detect_basins as detect_basins_impl};
-use crate::bat_library::{BondSet, CoordinateKind, CoordinateOptions, InternalCoordinates};
+use crate::bat_library::{
+    BondSet, CoordinateKind, CoordinateOptions, InternalCoordinates, TreeRule,
+};
 use crate::bias::BiasCorrection;
 use crate::quasi_harmonic::{MarginalEstimator, PeriodicCorrelation, QuasiHarmonicOptions};
 use crate::split::{
@@ -812,7 +814,7 @@ impl System {
 
 // Python keyword arguments, so the count is set by the public signature.
 #[allow(clippy::too_many_arguments)]
-#[pyfunction(signature = (top_path, traj_path, start=None, stop=None, torsions_only=None, stride=None, tree_bonds=false, phase_angles=true, bonds=None))]
+#[pyfunction(signature = (top_path, traj_path, start=None, stop=None, torsions_only=None, stride=None, tree_bonds=false, phase_angles=true, bonds=None, tree=None))]
 fn load_system(
     py: Python<'_>,
     top_path: &str,
@@ -824,7 +826,17 @@ fn load_system(
     tree_bonds: bool,
     phase_angles: bool,
     bonds: Option<&str>,
+    tree: Option<&str>,
 ) -> PyResult<System> {
+    let tree = match tree {
+        None | Some("mass") => TreeRule::MassOrdered,
+        Some("canonical") => TreeRule::Canonical,
+        Some(other) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "tree must be 'mass' or 'canonical', got {other:?}"
+            )));
+        }
+    };
     let bonds = match bonds {
         None if tree_bonds => BondSet::Tree,
         None => BondSet::HeavyAtom,
@@ -844,6 +856,7 @@ fn load_system(
     };
     let options = CoordinateOptions {
         bonds,
+        tree,
         phase_angles,
         ..Default::default()
     };

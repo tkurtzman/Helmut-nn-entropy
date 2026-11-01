@@ -1,7 +1,7 @@
 # Command line
 
 ```bash
-cargo run --release <path_to_parm7> <path_to_nc> [--torsions-only] [--no-periodic] [--exact-constant] [--start N] [--stop N] [--stride N] [--mie-order 1|2|3|4] [--theiler-window W] [--tree-bonds] [--no-phase-angles] [--jacobian] [--estimator nn|qh|bqh|split] [--histogram-bins N] [--periodic-correlation complex|centered] [--per-coordinate] [--mutual-information] [--soft topology|detect|LIST] [--soft-estimator mie|mist|network|joint] [--network-parents N] [--hard-estimator qh|bqh|qh-mie1|qh-mie2] [--coupling gaussian|states|none] [--soft-features complex|cossin|harmonics] [--harmonics N] [--state-torsions auto|LIST] [--min-state-frames N]
+cargo run --release <path_to_parm7> <path_to_nc> [--torsions-only] [--no-periodic] [--exact-constant] [--start N] [--stop N] [--stride N] [--mie-order 1|2|3|4] [--theiler-window W] [--tree-bonds] [--bonds heavy|tree|tree-unconstrained] [--no-phase-angles] [--jacobian] [--estimator nn|qh|bqh|split] [--histogram-bins N] [--periodic-correlation complex|centered] [--per-coordinate] [--mutual-information] [--soft topology|detect|LIST] [--soft-estimator mie|mist|network|joint] [--network-parents N] [--hard-estimator qh|bqh|qh-mie1|qh-mie2] [--coupling gaussian|states|none] [--soft-features complex|cossin|harmonics] [--harmonics N] [--state-torsions auto|LIST] [--min-state-frames N]
 ```
 
 Example:
@@ -22,8 +22,9 @@ cargo run --release <path_to_parm7> <path_to_nc>
 - `--theiler-window W` excludes temporally adjacent frames from the nearest-neighbor search: frame i's neighbor must satisfy |i - j| > W, counted in frames after `--start` and `--stride`. The default, 0, is the plain estimator. See [Correlated frames](correlated-frames.md).
 - `--exact-constant` uses the exact finite-sample term `psi(N) - psi(1) = H_(N-1)`. The default is the common approximation `ln(N) + EulerGamma`.
 - `--tree-bonds` uses the bonds of the BAT spanning tree, including bonds to hydrogen and excluding ring closures, in place of every heavy-atom bond. Use it only for trajectories without constrained bonds to hydrogen; see [Choosing the bond set](coordinates.md#choosing-the-bond-set).
+- `--bonds` selects the bond set outright: `heavy` (the default), `tree` (the same as `--tree-bonds`), or `tree-unconstrained`, the spanning tree without the bonds to hydrogen that SHAKE holds fixed. `tree-unconstrained` keeps the same angles and torsions as `tree` and is the one to use with constrained X-H bonds when the Jacobian is wanted. Pass `--bonds` or `--tree-bonds`, not both.
 - `--no-phase-angles` uses the raw torsions. By default each torsion that shares its central bond with an earlier torsion is replaced by its offset from that torsion. See [Coordinate sets](coordinates.md).
-- `--jacobian` also prints `Mean ln J = ...`, the mean of the log BAT Jacobian over the frames used, on the line before the entropy. It requires `--tree-bonds` and cannot be combined with `--torsions-only`.
+- `--jacobian` also prints `Mean ln J = ...`, the mean of the log BAT Jacobian over the frames used, on the line before the entropy. It requires `--tree-bonds` or `--bonds tree-unconstrained`, and cannot be combined with `--torsions-only`.
 - With `--estimator qh` or `bqh`, two lines before the total give the terms it is the sum of: `First-order entropy = ...` and `Correlation term = ...`.
 - `--estimator` chooses the estimator: `nn` (the default) is the nearest-neighbor MIE, `qh` is quasi-harmonic, `bqh` is Boltzmann quasi-harmonic, and `split` treats soft torsions non-parametrically and the rest with a Gaussian (see [Split estimator](split.md)). See [Quasi-harmonic estimators](quasi-harmonic.md). `--mie-order` applies only to `nn`.
 - `--histogram-bins N` makes `bqh` estimate each coordinate's first-order entropy from an N-bin histogram instead of nearest neighbors.

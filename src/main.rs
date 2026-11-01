@@ -2,6 +2,7 @@ use std::env;
 use std::path::Path;
 
 use molentropy::bat_library::{BondSet, CoordinateOptions, Geometry, InternalCoordinates};
+use molentropy::bias::BiasCorrection;
 use molentropy::legacy::legacy_entropy;
 use molentropy::quasi_harmonic::{
     MarginalEstimator, PeriodicCorrelation, QuasiHarmonicOptions,
@@ -138,6 +139,7 @@ fn main() {
     let mut per_coordinate = false;
     let mut mutual_information = false;
     let mut periodic_correlation: Option<PeriodicCorrelation> = None;
+    let mut bias_correction: Option<BiasCorrection> = None;
     // Split-estimator settings; None leaves the default.
     let mut soft: Option<CoordinateChoice> = None;
     let mut soft_estimator: Option<SoftEstimator> = None;
@@ -312,6 +314,17 @@ fn main() {
             }
             "--network-parents" => {
                 network_parents = Some(flag_value(&args, i));
+                i += 2;
+            }
+            "--bias" => {
+                bias_correction = Some(flag_choice(
+                    &args,
+                    i,
+                    &[
+                        ("none", BiasCorrection::None),
+                        ("wishart", BiasCorrection::Wishart),
+                    ],
+                ));
                 i += 2;
             }
             "--periodic-correlation" => {
@@ -493,6 +506,8 @@ fn main() {
         theiler_window,
     };
     let quasi_harmonic = QuasiHarmonicOptions {
+        bias: bias_correction.unwrap_or_default(),
+        effective_frames: None,
         marginals: match histogram_bins {
             Some(bins) => MarginalEstimator::Histogram { bins },
             None => MarginalEstimator::NearestNeighbor,
@@ -550,6 +565,8 @@ fn main() {
                 settings.hard_estimator = estimator;
             }
             settings.hard.marginals = quasi_harmonic.marginals;
+            settings.hard.bias = quasi_harmonic.bias;
+            settings.hard.effective_frames = quasi_harmonic.effective_frames;
             if let Some(periodic) = periodic_correlation {
                 settings.hard.periodic = periodic;
             }

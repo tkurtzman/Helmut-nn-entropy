@@ -5,6 +5,7 @@ use molentropy::bat_library::{
     BondSet, CoordinateOptions, Geometry, InternalCoordinates, TreeRule,
 };
 use molentropy::bias::BiasCorrection;
+use molentropy::coordinate_set::CoordinateSet;
 use molentropy::legacy::legacy_entropy;
 use molentropy::quasi_harmonic::{
     MarginalEstimator, PeriodicCorrelation, QuasiHarmonicOptions,
@@ -120,7 +121,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         fail(format!(
-            "Usage: {} <path_to_parm7> <path_to_nc> [--torsions-only] [--no-periodic] [--exact-constant] [--start N] [--stop N] [--stride N] [--mie-order 1|2|3|4] [--theiler-window W] [--tree-bonds] [--bonds heavy|tree|tree-unconstrained] [--tree mass|canonical] [--no-phase-angles] [--jacobian] [--estimator nn|qh|bqh|split] [--histogram-bins N] [--periodic-correlation complex|centered] [--per-coordinate] [--mutual-information] [--soft topology|detect|LIST] [--soft-estimator mie|mist|network|joint] [--network-parents N] [--hard-estimator qh|bqh|qh-mie1|qh-mie2] [--coupling gaussian|states|nn|none] [--soft-features complex|cossin|harmonics] [--harmonics N] [--state-torsions auto|LIST] [--min-state-frames N]",
+            "Usage: {} <path_to_parm7> <path_to_nc> [--torsions-only] [--no-periodic] [--exact-constant] [--start N] [--stop N] [--stride N] [--mie-order 1|2|3|4] [--theiler-window W] [--tree-bonds] [--bonds heavy|tree|tree-unconstrained] [--tree mass|canonical] [--no-phase-angles] [--jacobian] [--estimator nn|qh|bqh|split] [--histogram-bins N] [--periodic-correlation complex|centered] [--per-coordinate] [--mutual-information] [--soft topology|detect|LIST] [--soft-estimator mie|mist|network|joint] [--network-parents N] [--hard-estimator qh|bqh|qh-mie1|qh-mie2] [--coupling gaussian|states|nn|none] [--soft-features complex|cossin|harmonics] [--harmonics N] [--state-torsions auto|LIST] [--min-state-frames N] [--write-coordinates PREFIX] [--coordinate-format npy|tsv]\n   or: {0} <path_to_bat> <path_to_values> --from-coordinates [estimator flags]",
             args[0]
         ));
     }
@@ -156,6 +157,11 @@ fn main() {
     let mut state_torsions: Option<CoordinateChoice> = None;
     let mut min_state_frames: Option<usize> = None;
     let mut mie_order = 2;
+    // Read a coordinate set from files instead of building one from a
+    // topology and a Cartesian trajectory; write the generated one out.
+    let mut from_coordinates = false;
+    let mut write_coordinates: Option<String> = None;
+    let mut coordinate_format: Option<&str> = None;
     let mut stride = 1usize;
     let mut theiler_window = 0usize;
     let mut i = 3;
@@ -203,6 +209,21 @@ fn main() {
             "--jacobian" => {
                 jacobian = true;
                 i += 1;
+            }
+            "--from-coordinates" => {
+                from_coordinates = true;
+                i += 1;
+            }
+            "--write-coordinates" => {
+                if i + 1 >= args.len() {
+                    fail("--write-coordinates requires an output prefix");
+                }
+                write_coordinates = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--coordinate-format" => {
+                coordinate_format = Some(flag_choice(&args, i, &[("npy", "npy"), ("tsv", "tsv")]));
+                i += 2;
             }
             "--no-periodic" => {
                 no_periodic = true;
@@ -394,10 +415,32 @@ fn main() {
     } else {
         BondSet::HeavyAtom
     });
-    if jacobian && (!bonds.is_tree() || torsions_only) {
+    if !from_coordinates && jacobian && (!bonds.is_tree() || torsions_only) {
         fail(
             "--jacobian requires --tree-bonds (or --bonds tree-unconstrained) and cannot be combined with --torsions-only",
         );
+    }
+    // With --from-coordinates the coordinates are already built, so the flags
+    // that decide how to build them have nothing left to act on. The bond set
+    // and the tree rule travel in the definition file's header instead.
+    if from_coordinates {
+        let generator_flags = [
+            (torsions_only, "--torsions-only"),
+            (phase_angles.is_some(), "--phase-angles"),
+            (tree_bonds, "--tree-bonds"),
+            (bond_set.is_some(), "--bonds"),
+            (tree_rule.is_some(), "--tree"),
+            (legacy, "--legacy"),
+            (write_coordinates.is_some(), "--write-coordinates"),
+            (coordinate_format.is_some(), "--coordinate-format"),
+        ];
+        if let Some((_, flag)) = generator_flags.iter().find(|(given, _)| *given) {
+            fail(format!(
+                "{flag} builds the coordinates, which --from-coordinates reads from a file instead"
+            ));
+        }
+    } else if coordinate_format.is_some() && write_coordinates.is_none() {
+        fail("--coordinate-format applies only to --write-coordinates");
     }
 
     let split = estimator == Estimator::Split;
@@ -494,32 +537,67 @@ fn main() {
         }
     }
 
-    let coordinate_options = CoordinateOptions {
-        bonds,
-        tree: tree_rule.unwrap_or_default(),
-        // The original Python implementation used the raw torsions.
-        phase_angles: phase_angles.unwrap_or(!legacy),
-        geometry: if legacy {
-            Geometry::Legacy
-        } else {
-            Geometry::Standard
-        },
+    // Either the coordinates this crate generates from Cartesian frames, or a
+    // set some other program wrote out. From here on they are the same thing.
+    let internal = if from_coordinates {
+        let mut set = CoordinateSet::read(top_path, Some(traj_path)).unwrap_or_else(|err| {
+            fail(format!("Cannot read the coordinate set: {err}"));
+        });
+        if let Some(stop) = stop {
+            set.values.truncate(stop);
+        }
+        set
+    } else {
+        let coordinate_options = CoordinateOptions {
+            bonds,
+            tree: tree_rule.unwrap_or_default(),
+            // The original Python implementation used the raw torsions.
+            phase_angles: phase_angles.unwrap_or(!legacy),
+            geometry: if legacy {
+                Geometry::Legacy
+            } else {
+                Geometry::Standard
+            },
+        };
+        let mut generated = InternalCoordinates::with_options(top_path, coordinate_options)
+            .unwrap_or_else(|err| {
+                fail(format!(
+                    "Cannot read topology {}: {err}",
+                    top_path.display()
+                ))
+            });
+        generated
+            .calculate_internal_coords(traj_path, stop.unwrap_or(usize::MAX), torsions_only)
+            .unwrap_or_else(|err| {
+                fail(format!(
+                    "Cannot read trajectory {}: {err}",
+                    traj_path.display()
+                ))
+            });
+        CoordinateSet::from_internal(generated, coordinate_options)
     };
-    let mut internal = InternalCoordinates::with_options(top_path, coordinate_options)
-        .unwrap_or_else(|err| {
-            fail(format!(
-                "Cannot read topology {}: {err}",
-                top_path.display()
-            ))
-        });
-    internal
-        .calculate_internal_coords(traj_path, stop.unwrap_or(usize::MAX), torsions_only)
-        .unwrap_or_else(|err| {
-            fail(format!(
-                "Cannot read trajectory {}: {err}",
-                traj_path.display()
-            ))
-        });
+
+    if let Some(prefix) = &write_coordinates {
+        let format = coordinate_format.unwrap_or("npy");
+        let definitions = format!("{prefix}.bat");
+        let values = format!("{prefix}.{format}");
+        let meta = [
+            ("topology", top_path.display().to_string()),
+            ("trajectory", traj_path.display().to_string()),
+            ("tree", format!("{:?}", tree_rule.unwrap_or_default())),
+            ("coordinates", internal.dim.to_string()),
+            ("frames", internal.values.len().to_string()),
+        ];
+        internal
+            .write_definitions(Path::new(&definitions), &meta)
+            .and_then(|()| internal.write_values(Path::new(&values)))
+            .unwrap_or_else(|err| fail(format!("Cannot write the coordinate set: {err}")));
+        eprintln!(
+            "Wrote {definitions} ({} coordinates) and {values} ({} frames)",
+            internal.dim,
+            internal.values.len()
+        );
+    }
 
     let start = start.unwrap_or(0);
     let one_d_data = internal
@@ -813,9 +891,12 @@ fn main() {
     }
     if jacobian {
         // Over the same frames the entropy used.
+        // The native path checks the bond set before reading anything; a set
+        // read from a file carries its own, so this is where that one is
+        // found out.
         let log_jacobian = internal
             .log_jacobian()
-            .expect("a tree bond set without --torsions-only was checked above");
+            .unwrap_or_else(|err| fail(format!("Cannot compute the Jacobian: {err}")));
         let mean =
             log_jacobian.iter().skip(start).step_by(stride).sum::<f64>() / used_frames as f64;
         println!("Mean ln J = {}", mean);

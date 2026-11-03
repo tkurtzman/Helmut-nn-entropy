@@ -44,7 +44,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::CoordinateMetric;
-use crate::bat_library::{BondSet, CoordinateKind, InternalCoordinates, Result};
+use crate::bat_library::{BondSet, CoordinateKind, CoordinateOptions, InternalCoordinates, Result};
 
 /// The first line of a definition file, and the format it promises.
 const MAGIC: &str = "# molentropy coordinate set 1";
@@ -81,9 +81,13 @@ pub struct CoordinateSet {
 
 impl CoordinateSet {
     /// The coordinates the crate's own generator built, with whatever frames
-    /// have been read into it. Takes the generator by value because the values
-    /// move across rather than being copied.
-    pub fn from_internal(internal: InternalCoordinates) -> Self {
+    /// have been read into it.
+    ///
+    /// Takes the generator by value because the values move across rather than
+    /// being copied, and `options` because the set records which bond set it
+    /// came from: the BAT Jacobian is defined only for a tree one, and the
+    /// generator does not hand its settings back.
+    pub fn from_internal(internal: InternalCoordinates, options: CoordinateOptions) -> Self {
         let atoms = internal.coordinate_atoms();
         let kinds = internal.coordinate_kinds();
         let central = |index: usize| -> Option<(usize, usize)> {
@@ -108,7 +112,7 @@ impl CoordinateSet {
             ring: (0..dim).map(|i| about(i, &ring_bonds)).collect(),
             symmetric: (0..dim).map(|i| about(i, &symmetric_bonds)).collect(),
             soft: (0..dim).map(|i| soft.contains(&i)).collect(),
-            bonds: internal.options().bonds,
+            bonds: options.bonds,
             atoms,
             kinds,
             dim,

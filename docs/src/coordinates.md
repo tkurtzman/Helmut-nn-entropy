@@ -72,6 +72,8 @@ Each torsion is also classified by the bond it turns about, for the [split estim
 
 In Rust these are methods of `InternalCoordinates`; in Python, properties of a `System`. They depend only on the topology, and `--torsions-only` keeps them.
 
+These classes, the kinds and the coordinate values can all be written to a file and read back, so that the coordinates need not be generated here at all; see [Coordinate sets](coordinate-sets.md).
+
 ## Which atoms are used
 
 - File-based calculations select the solute automatically. Water is excluded when its atom type is an Amber water type (`OW`, `HW`, `EP`, `EPW`) or its residue is a water name (`WAT`, `HOH`, `SOL`, `TIP3`, `SPCE`, `OPC`, and similar), so four-point models and non-Amber water types are handled. Massless virtual sites are excluded because they carry no degrees of freedom. Monatomic species such as counter-ions contribute nothing, since they have no internal coordinates, and a diatomic contributes only its bond length (with the default bond set, only when both atoms are heavy). Solute atoms may appear anywhere in the topology.

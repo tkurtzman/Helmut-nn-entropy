@@ -1316,7 +1316,7 @@ mod cli {
             ),
             (
                 &["--estimator", "split", "--coupling", "maybe"][..],
-                "--coupling must be one of gaussian, states, none",
+                "--coupling must be one of gaussian, states, nn, none",
             ),
         ] {
             let output = run(&top, &traj, args);

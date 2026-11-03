@@ -12,6 +12,7 @@
 # Methods
 
 - [Coordinates](coordinates.md)
+- [Coordinate sets](coordinate-sets.md)
 - [Nearest-neighbor MIE](nn-mie.md)
 - [Quasi-harmonic estimators](quasi-harmonic.md)
 - [Split estimator](split.md)

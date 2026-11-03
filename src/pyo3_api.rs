@@ -314,10 +314,10 @@ impl SplitArguments {
                 ));
             }
         };
-        if !["gaussian", "states", "none"].contains(&coupling) {
+        if !["gaussian", "states", "nn", "none"].contains(&coupling) {
             return Err(invalid(
                 "coupling",
-                "'gaussian', 'states' or 'none'",
+                "'gaussian', 'states', 'nn' or 'none'",
                 coupling,
             ));
         }
@@ -405,6 +405,7 @@ impl SplitArguments {
         split.hard = self.hard;
         split.coupling = match self.coupling.as_str() {
             "none" => Coupling::None,
+            "nn" => Coupling::NearestNeighborMie,
             "gaussian" => Coupling::Gaussian {
                 features: self.soft_features,
             },

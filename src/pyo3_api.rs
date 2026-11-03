@@ -10,6 +10,7 @@ use crate::bat_library::{
     BondSet, CoordinateKind, CoordinateOptions, InternalCoordinates, TreeRule,
 };
 use crate::bias::BiasCorrection;
+use crate::coordinate_set::CoordinateSet;
 use crate::quasi_harmonic::{MarginalEstimator, PeriodicCorrelation, QuasiHarmonicOptions};
 use crate::split::{
     Coupling, DEFAULT_HARMONICS, HardEstimator, LARGE_SOFT_SET, SoftEstimator, SoftFeatures,
@@ -209,16 +210,15 @@ fn system_from_trajectory(
     });
 
     let frames = one_d_data[0].len();
+    let mut set = CoordinateSet::from_internal(internal, options);
+    // The values live in `one_d_data` from here on, one list per coordinate.
+    set.values = Vec::new();
     Ok(System {
         one_d_data,
         frames,
         metrics,
         mean_log_jacobian,
-        atoms: internal.coordinate_atoms(),
-        kinds: internal.coordinate_kinds(),
-        soft_torsions: internal.soft_torsions(),
-        symmetric_rotor_torsions: internal.symmetric_rotor_torsions(),
-        ring_torsions: internal.ring_torsions(),
+        set,
     })
 }
 
@@ -532,11 +532,9 @@ struct System {
     frames: usize,
     metrics: Vec<CoordinateMetric>,
     mean_log_jacobian: Option<f64>,
-    atoms: Vec<Vec<usize>>,
-    kinds: Vec<CoordinateKind>,
-    soft_torsions: Vec<usize>,
-    symmetric_rotor_torsions: Vec<usize>,
-    ring_torsions: Vec<usize>,
+    /// What the coordinates are, without their values: `one_d_data` holds
+    /// those, already cut down to the selected frames.
+    set: CoordinateSet,
 }
 
 impl System {
@@ -567,20 +565,25 @@ impl System {
     /// bond, three for an angle (vertex in the middle), four for a torsion.
     #[getter]
     fn atoms(&self) -> Vec<Vec<usize>> {
-        self.atoms.clone()
+        self.set.coordinate_atoms()
     }
 
     /// The kind of each coordinate: "bond", "angle", "torsion" or "phase angle".
     #[getter]
     fn kinds(&self) -> Vec<&'static str> {
-        self.kinds.iter().map(|kind| kind.name()).collect()
+        self.set
+            .coordinate_kinds()
+            .iter()
+            .map(|kind| kind.name())
+            .collect()
     }
 
     /// For each coordinate, the index of the torsion it is a phase angle of,
     /// or None.
     #[getter]
     fn phase_references(&self) -> Vec<Option<usize>> {
-        self.kinds
+        self.set
+            .coordinate_kinds()
             .iter()
             .map(|kind| match kind {
                 CoordinateKind::PhaseAngle { reference } => Some(*reference),
@@ -593,19 +596,19 @@ impl System {
     /// estimator's default soft set.
     #[getter]
     fn soft_torsions(&self) -> Vec<usize> {
-        self.soft_torsions.clone()
+        self.set.soft_torsions()
     }
 
     /// The soft torsions about symmetric rotors such as methyl groups.
     #[getter]
     fn symmetric_rotor_torsions(&self) -> Vec<usize> {
-        self.symmetric_rotor_torsions.clone()
+        self.set.symmetric_rotor_torsions()
     }
 
     /// Torsions about ring bonds.
     #[getter]
     fn ring_torsions(&self) -> Vec<usize> {
-        self.ring_torsions.clone()
+        self.set.ring_torsions()
     }
 
     /// The internal coordinates of the selected frames, one list per
@@ -636,6 +639,31 @@ impl System {
                 "the BAT Jacobian needs tree_bonds=True and every coordinate type",
             )
         })
+    }
+
+    /// Writes the coordinate set to `prefix.bat` and `prefix.npy` (or
+    /// `prefix.tsv` with `format='tsv'`), so that another program can read the
+    /// same coordinates, or `load_coordinates` can read them back without the
+    /// topology and trajectory. Only the selected frames are written.
+    #[pyo3(signature = (prefix, format="npy"))]
+    fn write_coordinates(&self, prefix: &str, format: &str) -> PyResult<()> {
+        if !["npy", "tsv"].contains(&format) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "format must be 'npy' or 'tsv', got {format:?}"
+            )));
+        }
+        // `one_d_data` is one list per coordinate; the file is one row per
+        // frame.
+        let mut set = self.set.clone();
+        set.values = (0..self.frames)
+            .map(|frame| self.one_d_data.iter().map(|column| column[frame]).collect())
+            .collect();
+        set.write_definitions(
+            Path::new(&format!("{prefix}.bat")),
+            &[("frames", self.frames.to_string())],
+        )
+        .and_then(|()| set.write_values(Path::new(&format!("{prefix}.{format}"))))
+        .map_err(to_py_err)
     }
 
     #[pyo3(signature = (mie_order=None, periodic=true, exact_constant=false, theiler_window=0))]
@@ -780,12 +808,14 @@ impl System {
             network_parents,
         )?;
         let metrics = self.metrics_for(periodic);
+        let soft = self.set.soft_torsions();
+        let symmetric = self.set.symmetric_rotor_torsions();
         let result = py.allow_threads(|| {
             arguments.estimate(
                 &self.one_d_data,
                 self.frames,
                 &metrics,
-                Some((&self.soft_torsions, &self.symmetric_rotor_torsions)),
+                Some((&soft, &symmetric)),
                 exact_constant,
                 theiler_window,
                 per_coordinate,
@@ -811,6 +841,56 @@ impl System {
             .map_err(pyo3::exceptions::PyValueError::new_err)
         })
     }
+}
+
+/// A System built from a coordinate set written by `System.write_coordinates`,
+/// by the `--write-coordinates` flag, or by any other program that follows the
+/// same format.
+///
+/// `definitions` is the `.bat` table of coordinates; `values` is the matching
+/// `.npy` or whitespace-separated text file of their values, one row per frame.
+/// No topology is needed: the table says which coordinates are torsions, which
+/// are phase angles and which make up the soft set.
+#[pyfunction(signature = (definitions, values, start=None, stop=None, stride=None))]
+fn load_coordinates(
+    py: Python<'_>,
+    definitions: &str,
+    values: &str,
+    start: Option<usize>,
+    stop: Option<usize>,
+    stride: Option<usize>,
+) -> PyResult<System> {
+    let (definitions, values) = (definitions.to_string(), values.to_string());
+    py.allow_threads(move || {
+        let mut set = CoordinateSet::read(Path::new(&definitions), Some(Path::new(&values)))
+            .map_err(to_py_err)?;
+        if let Some(stop) = stop {
+            set.values.truncate(stop);
+        }
+        let start = start.unwrap_or(0);
+        let stride = stride.unwrap_or(1);
+        let one_d_data = set
+            .columns(start, stride)
+            .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+        let mean_log_jacobian = set.log_jacobian().ok().map(|log_jacobian| {
+            let selected: Vec<f64> = log_jacobian
+                .into_iter()
+                .skip(start)
+                .step_by(stride)
+                .collect();
+            selected.iter().sum::<f64>() / selected.len() as f64
+        });
+        let frames = one_d_data[0].len();
+        let metrics = set.coordinate_metrics();
+        set.values = Vec::new();
+        Ok(System {
+            one_d_data,
+            frames,
+            metrics,
+            mean_log_jacobian,
+            set,
+        })
+    })
 }
 
 // Python keyword arguments, so the count is set by the public signature.
@@ -1147,6 +1227,7 @@ fn detect_basins(
 fn molentropy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<System>()?;
     m.add_function(wrap_pyfunction!(load_system, m)?)?;
+    m.add_function(wrap_pyfunction!(load_coordinates, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_entropy, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_coordinate_entropy, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_coordinate_mutual_information, m)?)?;

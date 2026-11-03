@@ -34,9 +34,11 @@ use crate::quasi_harmonic::{
 };
 use crate::{
     CoordinateMetric, EntropyOptions, calculate_entropy, estimate_coordinate_entropy,
-    estimate_coordinate_mist_entropy, estimate_coordinate_network_entropy, estimate_joint_entropy,
-    estimate_mist_entropy, estimate_network_entropy, resolve_input,
+    estimate_coordinate_mist_entropy, estimate_coordinate_mutual_information,
+    estimate_coordinate_network_entropy, estimate_joint_entropy, estimate_mist_entropy,
+    estimate_network_entropy, resolve_input,
 };
+use rayon::prelude::*;
 
 /// Above this many soft coordinates the front ends warn that the split
 /// estimator is outside its validated range. It was accurate to about 1 nat
@@ -201,6 +203,14 @@ pub enum Coupling<'a> {
         /// How soft torsions enter the correlation matrix.
         features: SoftFeatures,
     },
+    /// The nearest-neighbor pairwise mutual information between the two sets:
+    /// the hard-soft cross terms of the second-order expansion, estimated the
+    /// same way as the soft set's own pair terms and subtracted like them.
+    ///
+    /// This is the term that [`Coupling::None`] drops. It costs one
+    /// two-dimensional nearest-neighbor search per hard-soft pair, so the work
+    /// grows as the product of the two set sizes.
+    NearestNeighborMie,
 }
 
 /// Settings for [`estimate_split_entropy`].
@@ -596,6 +606,37 @@ fn split_parts(
                     }
                 }
                 coupling
+            }
+            Coupling::NearestNeighborMie => {
+                // Every hard-soft pair, estimated exactly as the soft block's
+                // own pair terms are, and subtracted as a pair term is.
+                let pairs: Vec<(usize, usize)> = hard_coordinates
+                    .iter()
+                    .flat_map(|&hard| soft_coordinates.iter().map(move |&soft| (hard, soft)))
+                    .collect();
+                let values: Vec<f64> = pairs
+                    .par_iter()
+                    .map(|&(hard, soft)| {
+                        let pair = [data[hard].clone(), data[soft].clone()];
+                        let pair_metrics = [metrics[hard], metrics[soft]];
+                        estimate_coordinate_mutual_information(
+                            &pair,
+                            frames_end,
+                            &with_metrics(options, &pair_metrics),
+                        )
+                        .map(|mutual| mutual[0])
+                    })
+                    .collect::<Result<Vec<f64>, String>>()
+                    .map_err(|err| format!("hard-soft cross terms: {err}"))?;
+                if want_shares {
+                    // Each pair term is split between the two coordinates it
+                    // involves, as in the rest of the expansion.
+                    for (&(hard, soft), &mutual) in pairs.iter().zip(&values) {
+                        coupling_shares[hard] -= 0.5 * mutual;
+                        coupling_shares[soft] -= 0.5 * mutual;
+                    }
+                }
+                -values.iter().sum::<f64>()
             }
             Coupling::PerState(state_options) => {
                 if options.theiler_window > 0

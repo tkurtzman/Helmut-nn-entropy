@@ -572,6 +572,7 @@ fn per_coordinate_shares_sum_to_the_totals() {
         QuasiHarmonicOptions {
             marginals: MarginalEstimator::Histogram { bins: 50 },
             periodic: PeriodicCorrelation::Centered,
+            ..Default::default()
         },
     ] {
         let (shares, totals) = per_coordinate(&data, &metrics, quasi_harmonic);

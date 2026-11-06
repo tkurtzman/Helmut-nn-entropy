@@ -10,6 +10,7 @@ The crate converts Amber trajectories to internal coordinates (bond lengths, bon
 - Estimators: the nearest-neighbor mutual information expansion (NN MIE) up to fourth order, with pairwise mutual information; the mutual information spanning tree (MIST) and its extension to a Bayesian network; quasi-harmonic (QH) and Boltzmann quasi-harmonic (BQH) entropy; and a split estimator that treats soft torsions non-parametrically and stiff coordinates with a Gaussian. Every estimator but the joint nearest-neighbor estimate can also report each coordinate's share of the entropy.
 - Validated against thermodynamic reference entropies; see [Validation](https://helmutcarter.github.io/molentropy/validation.html).
 - A CLI that reads `.parm7` + `.nc`, a Rust library, and Python bindings via `pyo3` for in-memory arrays or file-based calculation.
+- Coordinate sets that can be written out and read back, so the internal coordinates can come from another program; `python/bat_phase.py` builds them on the canonical tree with MDAnalysis. See [Coordinate sets](https://helmutcarter.github.io/molentropy/coordinate-sets.html).
 - A [user guide](https://helmutcarter.github.io/molentropy/) covering the CLI, Python and Rust interfaces and the methods.
 - Calculations parallelized with `rayon`.
 
@@ -32,7 +33,7 @@ For the Python module, use [maturin](https://www.maturin.rs/): `maturin develop 
 From the command line:
 
 ```bash
-cargo run --release <path_to_parm7> <path_to_nc> [--torsions-only] [--no-periodic] [--exact-constant] [--start N] [--stop N] [--stride N] [--mie-order 1|2|3|4] [--theiler-window W] [--tree-bonds] [--drop-constrained] [--no-phase-angles] [--jacobian] [--estimator nn|qh|bqh|split] [--histogram-bins N] [--periodic-correlation complex|centered] [--per-coordinate] [--mutual-information] [--soft topology|detect|LIST] [--soft-estimator mie|mist|network|joint] [--network-parents N] [--hard-estimator qh|bqh|qh-mie1|qh-mie2] [--coupling gaussian|states|none] [--soft-features complex|cossin|harmonics] [--harmonics N] [--state-torsions auto|LIST] [--min-state-frames N]
+cargo run --release <path_to_parm7> <path_to_nc> [--torsions-only] [--no-periodic] [--exact-constant] [--start N] [--stop N] [--stride N] [--mie-order 1|2|3|4] [--theiler-window W] [--tree-bonds] [--bonds heavy|tree|tree-unconstrained] [--tree mass|canonical] [--drop-constrained] [--no-phase-angles] [--jacobian] [--estimator nn|qh|bqh|split] [--histogram-bins N] [--periodic-correlation complex|centered] [--per-coordinate] [--mutual-information] [--soft topology|detect|LIST] [--soft-estimator mie|mist|network|joint] [--network-parents N] [--hard-estimator qh|bqh|qh-mie1|qh-mie2] [--coupling gaussian|states|nn|none] [--soft-features complex|cossin|harmonics] [--harmonics N] [--state-torsions auto|LIST] [--min-state-frames N] [--write-coordinates PREFIX] [--coordinate-format npy|tsv]
 ```
 
 Example:
@@ -54,6 +55,13 @@ import molentropy
 
 system = molentropy.load_system("system.parm7", "trajectory.nc")
 entropy = system.estimate_quasi_harmonic_entropy()["boltzmann_quasi_harmonic"]
+```
+
+To freeze the coordinates in a file and run from that file instead of the trajectory:
+
+```bash
+cargo run --release system.parm7 trajectory.nc --estimator bqh --write-coordinates run0
+cargo run --release run0.bat run0.npy --from-coordinates --estimator bqh
 ```
 
 The [user guide](https://helmutcarter.github.io/molentropy/) documents every [option](https://helmutcarter.github.io/molentropy/cli.html), the [Python](https://helmutcarter.github.io/molentropy/python.html) and [Rust](https://helmutcarter.github.io/molentropy/rust.html) interfaces, and the [methods](https://helmutcarter.github.io/molentropy/coordinates.html).

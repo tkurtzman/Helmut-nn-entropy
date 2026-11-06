@@ -13,6 +13,15 @@ change the API or the default estimates.
   the dropped coordinates' terms in the BAT Jacobian, so one run gives both
   the entropy and ln J. `System.constrained_atoms` and
   `InternalCoordinates::constrained_coordinates` list what was dropped.
+- Coordinate sets (`molentropy::coordinate_set::CoordinateSet`,
+  `--write-coordinates PREFIX` and `--from-coordinates`,
+  `System.write_coordinates` and `load_coordinates`): the internal coordinates
+  and their values can be written to a definition table and a value file and
+  read back without the topology, so they can be generated elsewhere. The
+  round trip reproduces the entropy exactly, the Jacobian included.
+- `python/bat_phase.py`, a generator for those files: the canonical tree and
+  the phase angles built with MDAnalysis, reproducing the crate's own
+  coordinates bit for bit.
 - A Bayesian network soft estimator (`estimate_network_entropy`,
   `--soft-estimator network`, `soft_estimator="network"`): MIST with each
   coordinate conditioned on up to several earlier ones (5 by default) instead

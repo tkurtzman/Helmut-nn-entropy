@@ -30,6 +30,9 @@ struct Prmtop {
     natom: usize,
     masses: Vec<f64>,
     atom_types: Vec<String>,
+    /// Per-atom PDB-style names (`N`, `CA`, `CB`, `HB1`, ...); empty when the
+    /// topology has no ATOM_NAME section. Used only by [`TreeRule::Canonical`].
+    atom_names: Vec<String>,
     /// Per-atom atomic numbers; empty when the topology predates ATOMIC_NUMBER.
     atomic_numbers: Vec<i64>,
     /// Per-atom residue labels; empty when RESIDUE_LABEL/POINTER are absent.
@@ -175,6 +178,16 @@ fn parse_prmtop_from_pointers(
         return Err("missing AMBER_ATOM_TYPE and ATOM_NAME sections".into());
     };
 
+    let atom_names = match sections.get("ATOM_NAME") {
+        Some(sec) => sec
+            .1
+            .iter()
+            .take(natom)
+            .map(|s| s.trim().to_string())
+            .collect(),
+        None => Vec::new(),
+    };
+
     let bond_h_tokens = sections
         .get("BONDS_INC_HYDROGEN")
         .map(|s| s.1.clone())
@@ -259,6 +272,7 @@ fn parse_prmtop_from_pointers(
         natom,
         masses,
         atom_types,
+        atom_names,
         atomic_numbers,
         residue_labels,
         bonds,
@@ -727,23 +741,295 @@ fn build_bat(fragment: &[usize], adjacency: &[Vec<usize>], masses: &[f64]) -> Re
     })
 }
 
+/// What the canonical builder needs to know about the atoms: PDB-style names
+/// and elements. Both may be empty, in which case the name-based rules fall
+/// back to atom order and the construction is still deterministic.
+pub(crate) struct Naming<'a> {
+    names: &'a [String],
+    atomic_numbers: &'a [i64],
+    masses: &'a [f64],
+}
+
+/// The backbone atom that continues the chain after `name`, so that walking
+/// N -> CA -> C -> N makes the primary torsion about each backbone bond the
+/// one that torsion is named for.
+fn backbone_successor(name: &str) -> Option<&'static str> {
+    match name {
+        "N" => Some("CA"),
+        "CA" => Some("C"),
+        "C" => Some("N"),
+        _ => None,
+    }
+}
+
+impl Naming<'_> {
+    fn name(&self, atom: usize) -> &str {
+        self.names.get(atom).map_or("", String::as_str)
+    }
+
+    /// Atomic number, from the topology when it has one and from the mass
+    /// otherwise.
+    fn element(&self, atom: usize) -> i64 {
+        match self.atomic_numbers.get(atom) {
+            Some(&z) if z > 0 => z,
+            _ => (self.masses[atom] / 1.9).round().max(1.0) as i64,
+        }
+    }
+
+    fn is_hydrogen(&self, atom: usize) -> bool {
+        self.element(atom) == 1
+    }
+
+    /// The trailing digits of a PDB atom name (`CG1` -> 1, `CG` -> 0), which
+    /// order the branches of a symmetric centre the way IUPAC does.
+    fn numeral(&self, atom: usize) -> u32 {
+        let digits: String = self
+            .name(atom)
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits
+            .chars()
+            .rev()
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    /// How good a continuation `child` is from `parent`, smallest first:
+    /// the backbone successor, then any other backbone atom, then the heavy
+    /// atom IUPAC numbers first (OG1 before CG2, CG1 before CG2), then
+    /// hydrogens.
+    fn priority(&self, parent: usize, child: usize) -> (u8, i64, u32, usize) {
+        let class = if self.is_hydrogen(child) {
+            3
+        } else if backbone_successor(self.name(parent)) == Some(self.name(child)) {
+            0
+        } else if matches!(self.name(child), "N" | "CA" | "C") {
+            1
+        } else {
+            2
+        };
+        (class, -self.element(child), self.numeral(child), child)
+    }
+}
+
+/// The canonical spanning tree: rooted at the N-terminal backbone nitrogen,
+/// grown along the chain, with the chemically named torsion primary about
+/// every central bond.
+///
+/// Walking N -> CA -> C -> N and taking the grandparent's own parent as the
+/// reference atom makes the four atoms of each backbone torsion the four the
+/// torsion is named for: `C(i-1)-N-CA-C` is phi, `N-CA-C-N(i+1)` is psi,
+/// `CA(i-1)-C(i-1)-N-CA` is omega, and in the side chain `N-CA-CB-CG` is
+/// chi1, `CA-CB-CG-CD` chi2, and so on outwards.
+///
+/// Molecules with no protein backbone — a ligand, a small molecule — are
+/// rooted at the highest-degree atom and the rest of the rule is unchanged,
+/// so the construction stays deterministic and never looks at the trajectory.
+fn build_bat_canonical(
+    fragment: &[usize],
+    adjacency: &[Vec<usize>],
+    naming: &Naming,
+) -> Result<Bat> {
+    let in_fragment: HashSet<usize> = fragment.iter().copied().collect();
+    if fragment.len() < 3 {
+        return Err("fragment must have at least 3 atoms".into());
+    }
+    let neighbors = |a: usize| -> Vec<usize> {
+        let mut list: Vec<usize> = adjacency[a]
+            .iter()
+            .copied()
+            .filter(|n| in_fragment.contains(n))
+            .collect();
+        list.sort_unstable();
+        list.dedup();
+        list
+    };
+    let ranked = |a: usize| -> Vec<usize> {
+        let mut list = neighbors(a);
+        list.sort_by_key(|&n| naming.priority(a, n));
+        list
+    };
+
+    // The N-terminal backbone nitrogen: an N bonded to a CA that is bonded to
+    // a C. The lowest index among them is the first residue, since Amber
+    // writes residues in order.
+    let root = fragment
+        .iter()
+        .copied()
+        .filter(|&a| naming.name(a) == "N")
+        .filter(|&a| {
+            neighbors(a).into_iter().any(|ca| {
+                naming.name(ca) == "CA" && neighbors(ca).into_iter().any(|c| naming.name(c) == "C")
+            })
+        })
+        .min()
+        .unwrap_or_else(|| {
+            // No backbone: the highest-degree atom, lowest index breaking ties.
+            *fragment
+                .iter()
+                .max_by_key(|&&a| (neighbors(a).len(), usize::MAX - a))
+                .expect("non-empty fragment")
+        });
+
+    // Breadth-first, each atom's neighbours in canonical order so that ring
+    // closures are broken the same way every time.
+    let mut parent: HashMap<usize, usize> = HashMap::new();
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut visit_order = vec![root];
+    let mut seen: HashSet<usize> = HashSet::from([root]);
+    let mut queue = VecDeque::from([root]);
+    while let Some(a) = queue.pop_front() {
+        for child in ranked(a) {
+            if seen.insert(child) {
+                parent.insert(child, a);
+                children.entry(a).or_default().push(child);
+                visit_order.push(child);
+                queue.push_back(child);
+            }
+        }
+    }
+    if visit_order.len() != fragment.len() {
+        return Err("fragment not connected".into());
+    }
+
+    // The root triple is the path root -> first -> second, the start of the
+    // chain. `first` must have a child of its own for the path to exist.
+    let root_children = children.get(&root).cloned().unwrap_or_default();
+    let first = root_children
+        .iter()
+        .copied()
+        .find(|c| children.contains_key(c))
+        .or_else(|| root_children.first().copied())
+        .ok_or("fragment has no second atom")?;
+    let second = children
+        .get(&first)
+        .and_then(|list| list.first().copied())
+        .or_else(|| root_children.iter().copied().find(|&c| c != first))
+        .ok_or("fragment has no third atom for the BAT root")?;
+    // Either root -> first -> second, or, when the third atom hangs off the
+    // root instead, second -> root -> first. Both are paths of bonded atoms.
+    let bat_root = if parent.get(&second) == Some(&first) {
+        [root, first, second]
+    } else {
+        [second, root, first]
+    };
+
+    // Coordinates are built in this order: the root triple, then the rest.
+    // An atom's reference may be any atom placed before it.
+    let mut placement: Vec<usize> = bat_root.to_vec();
+    placement.extend(
+        visit_order
+            .iter()
+            .copied()
+            .filter(|a| !bat_root.contains(a)),
+    );
+    let placed_at: HashMap<usize, usize> =
+        placement.iter().enumerate().map(|(i, &a)| (a, i)).collect();
+
+    // Subtree sizes break ties in favour of the branch that carries the rest
+    // of the molecule, when the names say nothing.
+    let mut subtree: HashMap<usize, usize> = visit_order.iter().map(|&a| (a, 1usize)).collect();
+    for &a in visit_order.iter().rev() {
+        if let Some(&p) = parent.get(&a) {
+            let size = subtree[&a];
+            *subtree.get_mut(&p).expect("parent is in the tree") += size;
+        }
+    }
+
+    // Every atom outside the root triple contributes one torsion
+    // (child, parent, grandparent, reference), grouped by the central bond.
+    let mut grouped: Vec<((usize, usize), Vec<[usize; 4]>)> = Vec::new();
+    let mut slot_of: HashMap<(usize, usize), usize> = HashMap::new();
+    for &a in placement.iter().skip(bat_root.len()) {
+        let p = parent[&a];
+        // The root's other children have no grandparent of their own, so they
+        // use `first`, which the root triple has already placed.
+        let g = parent.get(&p).copied().unwrap_or(first);
+        let before = |x: usize| placed_at[&x] < placed_at[&a];
+        let reference = parent
+            .get(&g)
+            .copied()
+            .filter(|&h| h != p && h != a && before(h))
+            .or_else(|| {
+                ranked(g)
+                    .into_iter()
+                    .find(|&h| h != p && h != a && before(h))
+            })
+            .or_else(|| {
+                placement[..placed_at[&a]]
+                    .iter()
+                    .copied()
+                    .find(|&h| h != p && h != g && h != a)
+            })
+            .ok_or("no reference atom for a BAT torsion")?;
+        // The crate groups phase angles by the unordered central bond, so the
+        // grouping here has to match or the primary would not be the one this
+        // rule chose.
+        let key = (p.min(g), p.max(g));
+        let slot = *slot_of.entry(key).or_insert_with(|| {
+            grouped.push((key, Vec::new()));
+            grouped.len() - 1
+        });
+        grouped[slot].1.push([a, p, g, reference]);
+    }
+
+    // Within each central bond the named torsion goes first: it becomes the
+    // primary, and every other member of the group becomes a phase angle
+    // measured from it.
+    let mut torsions = Vec::new();
+    for (_, mut group) in grouped {
+        group.sort_by_key(|t| {
+            let (class, element, numeral, atom) = naming.priority(t[1], t[0]);
+            (class, usize::MAX - subtree[&t[0]], element, numeral, atom)
+        });
+        torsions.extend(group);
+    }
+
+    let angles = torsions.iter().map(|t| [t[0], t[1], t[2]]).collect();
+    Ok(Bat {
+        root: bat_root,
+        torsions,
+        angles,
+    })
+}
+
 fn build_bat_list(
     fragment: &[usize],
     adjacency: &[Vec<usize>],
     hydrogens: &HashSet<usize>,
     masses: &[f64],
     bonds: BondSet,
+    tree: TreeRule,
+    naming: &Naming,
 ) -> Result<Vec<Vec<usize>>> {
     let mut bat_list = Vec::new();
 
-    let bat = build_bat(fragment, adjacency, masses)?;
-    if bonds == BondSet::Tree {
+    let bat = match tree {
+        TreeRule::MassOrdered => build_bat(fragment, adjacency, masses)?,
+        TreeRule::Canonical => build_bat_canonical(fragment, adjacency, naming)?,
+    };
+    if bonds.is_tree() {
         // The two root bonds, then the bond that places each later atom, in
-        // the same order as the angles and torsions below.
-        bat_list.push(vec![bat.root[0], bat.root[1]]);
-        bat_list.push(vec![bat.root[1], bat.root[2]]);
+        // the same order as the angles and torsions below. Under
+        // `TreeUnconstrained` a bond to hydrogen is held fixed by the
+        // simulation and is not a coordinate; the tree itself, and so every
+        // angle and torsion, is unchanged.
+        let keep = |a: usize, b: usize| {
+            bonds == BondSet::Tree || !(hydrogens.contains(&a) || hydrogens.contains(&b))
+        };
+        if keep(bat.root[0], bat.root[1]) {
+            bat_list.push(vec![bat.root[0], bat.root[1]]);
+        }
+        if keep(bat.root[1], bat.root[2]) {
+            bat_list.push(vec![bat.root[1], bat.root[2]]);
+        }
         for t in bat.torsions.iter() {
-            bat_list.push(vec![t[0], t[1]]);
+            if keep(t[0], t[1]) {
+                bat_list.push(vec![t[0], t[1]]);
+            }
         }
     } else {
         let fragment_set: HashSet<usize> = fragment.iter().copied().collect();
@@ -790,6 +1076,59 @@ pub enum BondSet {
     /// With the angles and torsions this is a non-redundant set of 3N - 6
     /// coordinates per molecule, the set the BAT Jacobian is defined for.
     Tree,
+    /// The bonds of the BAT spanning tree, minus the bonds to hydrogen, which
+    /// SHAKE and the other constraint algorithms hold at a fixed length.
+    ///
+    /// The spanning tree is built exactly as for [`BondSet::Tree`], so the
+    /// angles and torsions are the same and the set is still non-redundant;
+    /// only the constrained bond lengths are left out. This is the right set
+    /// for a trajectory run with constrained X-H bonds: those lengths carry
+    /// no entropy, and keeping them adds the entropy of the constraint
+    /// algorithm's numerical noise, a few tenths of k_B per bond. It differs
+    /// from [`BondSet::HeavyAtom`], which also drops the ring-closure bonds
+    /// and does not follow the tree.
+    TreeUnconstrained,
+}
+
+impl BondSet {
+    /// Whether the bonds are taken from the BAT spanning tree, so that the
+    /// coordinates are non-redundant and the Jacobian is defined.
+    pub fn is_tree(self) -> bool {
+        matches!(self, Self::Tree | Self::TreeUnconstrained)
+    }
+}
+
+/// Which spanning tree defines the BAT coordinates.
+///
+/// A molecule has many valid BAT trees, and they do not all give the same
+/// answer: the joint entropy is invariant under the phase-angle shear, but a
+/// sum of marginals is not, and a second-order truncation is not. On the
+/// alanine dipeptide the choice of tree moves a truncated estimate by up to
+/// 0.6 kcal/mol, so it is a stated convention, not an implementation detail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TreeRule {
+    /// Rooted at the heaviest terminal atom and grown lightest-first, the
+    /// construction MDAnalysis uses. Depends on nothing but the masses, and
+    /// makes no attempt to put the chemically named torsion first.
+    #[default]
+    MassOrdered,
+    /// Rooted at the N-terminal backbone nitrogen and grown along the chain,
+    /// with the chemically named torsion primary about every central bond:
+    /// `C(i-1)-N-CA-C` (phi), `N-CA-C-N(i+1)` (psi), `CA(i-1)-C(i-1)-N-CA`
+    /// (omega) and `N-CA-CB-CG` (chi1), with the side chain continuing
+    /// outwards in IUPAC order.
+    ///
+    /// The point is comparability: the primary torsions are the ones people
+    /// already name, so the soft set is exactly the named rotatable torsions
+    /// and a per-residue map means the same thing in two different proteins.
+    /// It also removes the main source of per-atom instability, a hydrogen
+    /// that is a primary-torsion partner under one tree and only a
+    /// phase-angle partner under another.
+    ///
+    /// Molecules with no backbone, such as a ligand, are rooted at the
+    /// highest-degree atom; everything else about the rule is unchanged, so it
+    /// stays deterministic and never looks at the trajectory.
+    Canonical,
 }
 
 /// How angles and torsions are evaluated from positions.
@@ -824,6 +1163,8 @@ pub struct CoordinateOptions {
     /// torsions of atoms that rotate together, such as a methyl group's
     /// hydrogens, are redundant, and every estimator does worse on them.
     pub phase_angles: bool,
+    /// Which spanning tree the coordinates are built on.
+    pub tree: TreeRule,
     /// The angle and torsion formulas.
     pub geometry: Geometry,
     /// Drop every bond and angle that the trajectory shows to be constrained:
@@ -849,6 +1190,7 @@ impl Default for CoordinateOptions {
         Self {
             bonds: BondSet::default(),
             phase_angles: true,
+            tree: TreeRule::default(),
             geometry: Geometry::default(),
             drop_constrained: false,
         }
@@ -1046,6 +1388,12 @@ impl InternalCoordinates {
                     &hydrogens,
                     &prmtop.masses,
                     options.bonds,
+                    options.tree,
+                    &Naming {
+                        names: &prmtop.atom_names,
+                        atomic_numbers: &prmtop.atomic_numbers,
+                        masses: &prmtop.masses,
+                    },
                 )?),
             }
             atoms.extend(fragment);
@@ -1370,12 +1718,20 @@ impl InternalCoordinates {
     /// entropy gives the entropy of the internal motion in Cartesian
     /// coordinates. Bond lengths are in the trajectory's units.
     ///
-    /// Defined only for the full non-redundant set: `BondSet::Tree`, without
-    /// `torsions_only`. Phase angles do not change it, and coordinates dropped
-    /// as constrained still contribute their terms.
+    /// Defined only for a non-redundant tree set, `BondSet::Tree` or
+    /// `BondSet::TreeUnconstrained`, without `torsions_only`. Phase angles do
+    /// not change it.
+    ///
+    /// The two ways of leaving constrained bonds out differ here. A coordinate
+    /// dropped by `drop_constrained` still contributes its term, so
+    /// `--tree-bonds --drop-constrained --jacobian` gives the entropy and the
+    /// full Jacobian in one run. Under `TreeUnconstrained` the constrained
+    /// bonds are never coordinates in the first place, so their `2 ln b` terms
+    /// are left out; each is a constant of the molecule and cancels in a
+    /// difference between two ensembles of it.
     pub fn log_jacobian(&self) -> Result<Vec<f64>> {
-        if self.options.bonds != BondSet::Tree {
-            return Err("the BAT Jacobian needs the tree bond set".into());
+        if !self.options.bonds.is_tree() {
+            return Err("the BAT Jacobian needs a tree bond set".into());
         }
         if self.torsions_only {
             return Err("the BAT Jacobian needs bonds and angles, not torsions only".into());

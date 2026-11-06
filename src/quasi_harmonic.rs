@@ -21,6 +21,7 @@
 
 use rayon::prelude::*;
 
+use crate::bias::{self, BiasCorrection};
 use crate::{CoordinateMetric, EntropyOptions, coordinate_entropy_impl, resolve_input};
 
 /// How the first-order entropy -integral p ln p of each coordinate is estimated
@@ -58,12 +59,25 @@ pub enum PeriodicCorrelation {
 }
 
 /// Settings specific to the quasi-harmonic estimators.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct QuasiHarmonicOptions {
     /// How BQH estimates each coordinate's first-order entropy.
     pub marginals: MarginalEstimator,
     /// How periodic coordinates enter the correlation matrix.
     pub periodic: PeriodicCorrelation,
+    /// Whether the Gaussian terms carry the Wishart finite-sample bias
+    /// correction. Defaults to [`BiasCorrection::None`], the historical
+    /// behavior.
+    pub bias: BiasCorrection,
+    /// The number of *independent* samples, if it differs from the number of
+    /// frames. The bias correction is a function of this, not of the frame
+    /// count; see [`crate::bias::effective_frames_from_null`].
+    pub effective_frames: Option<f64>,
+}
+
+/// The degrees of freedom the bias correction is evaluated at.
+fn degrees_of_freedom(quasi_harmonic: &QuasiHarmonicOptions, frames_end: usize) -> f64 {
+    quasi_harmonic.effective_frames.unwrap_or(frames_end as f64) - 1.0
 }
 
 /// QH and BQH totals with the terms they are built from, all in units of k_B.
@@ -131,7 +145,16 @@ pub(crate) fn quasi_harmonic_terms(
     )?;
     let first_order_gaussian = terms.first_order_gaussian.iter().sum();
     let first_order_boltzmann = terms.first_order_boltzmann.iter().sum();
-    let correlation = 0.5 * log_determinant(&terms.correlation)?;
+    let mut correlation = 0.5 * log_determinant(&terms.correlation)?;
+    if quasi_harmonic.bias == BiasCorrection::Wishart {
+        let nu = degrees_of_freedom(quasi_harmonic, frames_end);
+        let dimensions = terms.first_order_gaussian.len();
+        correlation -= bias::correlation_correction(nu, dimensions).ok_or_else(|| {
+            format!(
+                "the Wishart correction needs more than {dimensions} independent samples, got {nu} degrees of freedom"
+            )
+        })?;
+    }
     Ok(QuasiHarmonicEntropy {
         quasi_harmonic: first_order_gaussian + correlation,
         boltzmann_quasi_harmonic: first_order_boltzmann + correlation,
@@ -226,6 +249,18 @@ pub(crate) fn truncated_quasi_harmonic_terms(
     let mut shares = terms.first_order_gaussian;
     if order == 2 {
         let tolerance = singular_tolerance(2);
+        // S = S1 - sum I2, and the corrected I2 is the plug-in value minus the
+        // residual, so each pair hands the residual back to the entropy, split
+        // evenly between its two coordinates.
+        let half_residual = match quasi_harmonic.bias {
+            BiasCorrection::None => 0.0,
+            BiasCorrection::Wishart => {
+                let nu = degrees_of_freedom(quasi_harmonic, frames_end);
+                0.5 * bias::pair_residual(nu).ok_or_else(|| {
+                    format!("the Wishart correction needs more than 2 independent samples, got {nu} degrees of freedom")
+                })?
+            }
+        };
         for (i, row) in terms.correlation.iter().enumerate() {
             for (j, &(real, imaginary)) in row.iter().enumerate().skip(i + 1) {
                 let unexplained = 1.0 - (real * real + imaginary * imaginary);
@@ -234,7 +269,7 @@ pub(crate) fn truncated_quasi_harmonic_terms(
                         "coordinates {i} and {j} are perfectly correlated, so their pairwise mutual information is infinite"
                     ));
                 }
-                let half_pair = 0.25 * unexplained.ln();
+                let half_pair = 0.25 * unexplained.ln() + half_residual;
                 shares[i] += half_pair;
                 shares[j] += half_pair;
             }
@@ -272,11 +307,20 @@ fn terms(
         .zip(metrics.par_iter())
         .map(|(values, metric)| center(values, *metric))
         .collect();
+    let marginal_bias = match quasi_harmonic.bias {
+        BiasCorrection::None => 0.0,
+        BiasCorrection::Wishart => {
+            let nu = degrees_of_freedom(quasi_harmonic, frames_end);
+            bias::marginal_correction(nu).ok_or_else(|| {
+                format!("the Wishart correction needs more than 1 independent sample, got {nu} degrees of freedom")
+            })?
+        }
+    };
     let first_order_gaussian = centered
         .iter()
         .map(|values| {
             let variance = mean_square(values);
-            0.5 * (2.0 * std::f64::consts::PI * std::f64::consts::E * variance).ln()
+            0.5 * (2.0 * std::f64::consts::PI * std::f64::consts::E * variance).ln() - marginal_bias
         })
         .collect();
 

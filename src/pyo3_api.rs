@@ -6,7 +6,11 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::basins::{BasinOptions, detect_basins as detect_basins_impl};
-use crate::bat_library::{BondSet, CoordinateKind, CoordinateOptions, InternalCoordinates};
+use crate::bat_library::{
+    BondSet, CoordinateKind, CoordinateOptions, InternalCoordinates, TreeRule,
+};
+use crate::bias::BiasCorrection;
+use crate::coordinate_set::CoordinateSet;
 use crate::quasi_harmonic::{MarginalEstimator, PeriodicCorrelation, QuasiHarmonicOptions};
 use crate::split::{
     Coupling, DEFAULT_HARMONICS, HardEstimator, LARGE_SOFT_SET, SoftEstimator, SoftFeatures,
@@ -50,13 +54,15 @@ fn quasi_harmonic(
     metrics: &[CoordinateMetric],
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
     exact_constant: bool,
     theiler_window: usize,
 ) -> PyResult<HashMap<&'static str, f64>> {
     let entropy = crate::quasi_harmonic::estimate_quasi_harmonic_entropy(
         one_d_data,
         frames,
-        &quasi_harmonic_options(histogram_bins, periodic_correlation)?,
+        &quasi_harmonic_options(histogram_bins, periodic_correlation, bias, effective_frames)?,
         &entropy_options(metrics, exact_constant, theiler_window),
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -77,13 +83,15 @@ fn coordinate_quasi_harmonic(
     metrics: &[CoordinateMetric],
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
     exact_constant: bool,
     theiler_window: usize,
 ) -> PyResult<HashMap<&'static str, Vec<f64>>> {
     let entropy = crate::quasi_harmonic::estimate_coordinate_quasi_harmonic_entropy(
         one_d_data,
         frames,
-        &quasi_harmonic_options(histogram_bins, periodic_correlation)?,
+        &quasi_harmonic_options(histogram_bins, periodic_correlation, bias, effective_frames)?,
         &entropy_options(metrics, exact_constant, theiler_window),
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -99,8 +107,21 @@ fn coordinate_quasi_harmonic(
 fn quasi_harmonic_options(
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
 ) -> PyResult<QuasiHarmonicOptions> {
+    let bias = match bias {
+        "none" => BiasCorrection::None,
+        "wishart" => BiasCorrection::Wishart,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "bias must be \"none\" or \"wishart\", got {other:?}"
+            )));
+        }
+    };
     Ok(QuasiHarmonicOptions {
+        bias,
+        effective_frames,
         marginals: match histogram_bins {
             Some(bins) => MarginalEstimator::Histogram { bins },
             None => MarginalEstimator::NearestNeighbor,
@@ -189,17 +210,15 @@ fn system_from_trajectory(
     });
 
     let frames = one_d_data[0].len();
+    let mut set = CoordinateSet::from_internal(internal, options);
+    // The values live in `one_d_data` from here on, one list per coordinate.
+    set.values = Vec::new();
     Ok(System {
         one_d_data,
         frames,
         metrics,
         mean_log_jacobian,
-        atoms: internal.coordinate_atoms(),
-        constrained: internal.constrained_coordinates(),
-        kinds: internal.coordinate_kinds(),
-        soft_torsions: internal.soft_torsions(),
-        symmetric_rotor_torsions: internal.symmetric_rotor_torsions(),
-        ring_torsions: internal.ring_torsions(),
+        set,
     })
 }
 
@@ -258,6 +277,8 @@ impl SplitArguments {
         min_state_frames: usize,
         histogram_bins: Option<usize>,
         periodic_correlation: &str,
+        bias: &str,
+        effective_frames: Option<f64>,
         network_parents: usize,
     ) -> PyResult<Self> {
         let invalid = |name: &str, allowed: &str, got: &str| {
@@ -293,10 +314,10 @@ impl SplitArguments {
                 ));
             }
         };
-        if !["gaussian", "states", "none"].contains(&coupling) {
+        if !["gaussian", "states", "nn", "none"].contains(&coupling) {
             return Err(invalid(
                 "coupling",
-                "'gaussian', 'states' or 'none'",
+                "'gaussian', 'states', 'nn' or 'none'",
                 coupling,
             ));
         }
@@ -336,7 +357,12 @@ impl SplitArguments {
             soft: SoftArgument::extract(soft)?,
             soft_estimator,
             hard_estimator,
-            hard: quasi_harmonic_options(histogram_bins, periodic_correlation)?,
+            hard: quasi_harmonic_options(
+                histogram_bins,
+                periodic_correlation,
+                bias,
+                effective_frames,
+            )?,
             coupling: coupling.to_string(),
             soft_features,
             state_coordinates,
@@ -379,6 +405,7 @@ impl SplitArguments {
         split.hard = self.hard;
         split.coupling = match self.coupling.as_str() {
             "none" => Coupling::None,
+            "nn" => Coupling::NearestNeighborMie,
             "gaussian" => Coupling::Gaussian {
                 features: self.soft_features,
             },
@@ -505,12 +532,9 @@ struct System {
     frames: usize,
     metrics: Vec<CoordinateMetric>,
     mean_log_jacobian: Option<f64>,
-    atoms: Vec<Vec<usize>>,
-    constrained: Vec<Vec<usize>>,
-    kinds: Vec<CoordinateKind>,
-    soft_torsions: Vec<usize>,
-    symmetric_rotor_torsions: Vec<usize>,
-    ring_torsions: Vec<usize>,
+    /// What the coordinates are, without their values: `one_d_data` holds
+    /// those, already cut down to the selected frames.
+    set: CoordinateSet,
 }
 
 impl System {
@@ -541,7 +565,7 @@ impl System {
     /// bond, three for an angle (vertex in the middle), four for a torsion.
     #[getter]
     fn atoms(&self) -> Vec<Vec<usize>> {
-        self.atoms.clone()
+        self.set.coordinate_atoms()
     }
 
     /// Topology atom indices of each bond and angle dropped as constrained by
@@ -549,20 +573,25 @@ impl System {
     /// otherwise.
     #[getter]
     fn constrained_atoms(&self) -> Vec<Vec<usize>> {
-        self.constrained.clone()
+        self.set.constrained_coordinates()
     }
 
     /// The kind of each coordinate: "bond", "angle", "torsion" or "phase angle".
     #[getter]
     fn kinds(&self) -> Vec<&'static str> {
-        self.kinds.iter().map(|kind| kind.name()).collect()
+        self.set
+            .coordinate_kinds()
+            .iter()
+            .map(|kind| kind.name())
+            .collect()
     }
 
     /// For each coordinate, the index of the torsion it is a phase angle of,
     /// or None.
     #[getter]
     fn phase_references(&self) -> Vec<Option<usize>> {
-        self.kinds
+        self.set
+            .coordinate_kinds()
             .iter()
             .map(|kind| match kind {
                 CoordinateKind::PhaseAngle { reference } => Some(*reference),
@@ -575,19 +604,19 @@ impl System {
     /// estimator's default soft set.
     #[getter]
     fn soft_torsions(&self) -> Vec<usize> {
-        self.soft_torsions.clone()
+        self.set.soft_torsions()
     }
 
     /// The soft torsions about symmetric rotors such as methyl groups.
     #[getter]
     fn symmetric_rotor_torsions(&self) -> Vec<usize> {
-        self.symmetric_rotor_torsions.clone()
+        self.set.symmetric_rotor_torsions()
     }
 
     /// Torsions about ring bonds.
     #[getter]
     fn ring_torsions(&self) -> Vec<usize> {
-        self.ring_torsions.clone()
+        self.set.ring_torsions()
     }
 
     /// The internal coordinates of the selected frames, one list per
@@ -610,7 +639,7 @@ impl System {
 
     /// Mean over the selected frames of ln J, the internal part of the BAT
     /// Jacobian. Available only for a System loaded with `tree_bonds=True`
-    /// and without `torsions_only`.
+    /// (or `bonds='tree-unconstrained'`) and without `torsions_only`.
     #[getter]
     fn mean_log_jacobian(&self) -> PyResult<f64> {
         self.mean_log_jacobian.ok_or_else(|| {
@@ -618,6 +647,31 @@ impl System {
                 "the BAT Jacobian needs tree_bonds=True and every coordinate type",
             )
         })
+    }
+
+    /// Writes the coordinate set to `prefix.bat` and `prefix.npy` (or
+    /// `prefix.tsv` with `format='tsv'`), so that another program can read the
+    /// same coordinates, or `load_coordinates` can read them back without the
+    /// topology and trajectory. Only the selected frames are written.
+    #[pyo3(signature = (prefix, format="npy"))]
+    fn write_coordinates(&self, prefix: &str, format: &str) -> PyResult<()> {
+        if !["npy", "tsv"].contains(&format) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "format must be 'npy' or 'tsv', got {format:?}"
+            )));
+        }
+        // `one_d_data` is one list per coordinate; the file is one row per
+        // frame.
+        let mut set = self.set.clone();
+        set.values = (0..self.frames)
+            .map(|frame| self.one_d_data.iter().map(|column| column[frame]).collect())
+            .collect();
+        set.write_definitions(
+            Path::new(&format!("{prefix}.bat")),
+            &[("frames", self.frames.to_string())],
+        )
+        .and_then(|()| set.write_values(Path::new(&format!("{prefix}.{format}"))))
+        .map_err(to_py_err)
     }
 
     #[pyo3(signature = (mie_order=None, periodic=true, exact_constant=false, theiler_window=0))]
@@ -661,12 +715,14 @@ impl System {
     }
 
     /// QH and BQH entropy; see the module function of the same name.
-    #[pyo3(signature = (histogram_bins=None, periodic_correlation="complex", periodic=true, exact_constant=false, theiler_window=0))]
+    #[pyo3(signature = (histogram_bins=None, periodic_correlation="complex", bias="none", effective_frames=None, periodic=true, exact_constant=false, theiler_window=0))]
     fn estimate_quasi_harmonic_entropy(
         &self,
         py: Python<'_>,
         histogram_bins: Option<usize>,
         periodic_correlation: &str,
+        bias: &str,
+        effective_frames: Option<f64>,
         periodic: bool,
         exact_constant: bool,
         theiler_window: usize,
@@ -678,6 +734,8 @@ impl System {
                 &self.metrics_for(periodic),
                 histogram_bins,
                 periodic_correlation,
+                bias,
+                effective_frames,
                 exact_constant,
                 theiler_window,
             )
@@ -686,12 +744,14 @@ impl System {
 
     /// Each coordinate's share of the QH and BQH entropy; see the module
     /// function of the same name.
-    #[pyo3(signature = (histogram_bins=None, periodic_correlation="complex", periodic=true, exact_constant=false, theiler_window=0))]
+    #[pyo3(signature = (histogram_bins=None, periodic_correlation="complex", bias="none", effective_frames=None, periodic=true, exact_constant=false, theiler_window=0))]
     fn estimate_coordinate_quasi_harmonic_entropy(
         &self,
         py: Python<'_>,
         histogram_bins: Option<usize>,
         periodic_correlation: &str,
+        bias: &str,
+        effective_frames: Option<f64>,
         periodic: bool,
         exact_constant: bool,
         theiler_window: usize,
@@ -703,6 +763,8 @@ impl System {
                 &self.metrics_for(periodic),
                 histogram_bins,
                 periodic_correlation,
+                bias,
+                effective_frames,
                 exact_constant,
                 theiler_window,
             )
@@ -712,7 +774,7 @@ impl System {
     /// Split entropy; see the module function of the same name. `soft=None`
     /// uses the System's soft torsions.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (soft=None, soft_estimator="mie", mie_order=2, hard_estimator="qh", coupling="gaussian", soft_features="harmonics", harmonics=None, state_coordinates=None, state_labels=None, min_state_frames=300, histogram_bins=None, periodic_correlation="centered", periodic=true, exact_constant=false, theiler_window=0, per_coordinate=false, network_parents=5))]
+    #[pyo3(signature = (soft=None, soft_estimator="mie", mie_order=2, hard_estimator="qh", coupling="gaussian", soft_features="harmonics", harmonics=None, state_coordinates=None, state_labels=None, min_state_frames=300, histogram_bins=None, periodic_correlation="centered", bias="none", effective_frames=None, periodic=true, exact_constant=false, theiler_window=0, per_coordinate=false, network_parents=5))]
     fn estimate_split_entropy(
         &self,
         py: Python<'_>,
@@ -728,6 +790,8 @@ impl System {
         min_state_frames: usize,
         histogram_bins: Option<usize>,
         periodic_correlation: &str,
+        bias: &str,
+        effective_frames: Option<f64>,
         periodic: bool,
         exact_constant: bool,
         theiler_window: usize,
@@ -747,15 +811,19 @@ impl System {
             min_state_frames,
             histogram_bins,
             periodic_correlation,
+            bias,
+            effective_frames,
             network_parents,
         )?;
         let metrics = self.metrics_for(periodic);
+        let soft = self.set.soft_torsions();
+        let symmetric = self.set.symmetric_rotor_torsions();
         let result = py.allow_threads(|| {
             arguments.estimate(
                 &self.one_d_data,
                 self.frames,
                 &metrics,
-                Some((&self.soft_torsions, &self.symmetric_rotor_torsions)),
+                Some((&soft, &symmetric)),
                 exact_constant,
                 theiler_window,
                 per_coordinate,
@@ -783,9 +851,59 @@ impl System {
     }
 }
 
+/// A System built from a coordinate set written by `System.write_coordinates`,
+/// by the `--write-coordinates` flag, or by any other program that follows the
+/// same format.
+///
+/// `definitions` is the `.bat` table of coordinates; `values` is the matching
+/// `.npy` or whitespace-separated text file of their values, one row per frame.
+/// No topology is needed: the table says which coordinates are torsions, which
+/// are phase angles and which make up the soft set.
+#[pyfunction(signature = (definitions, values, start=None, stop=None, stride=None))]
+fn load_coordinates(
+    py: Python<'_>,
+    definitions: &str,
+    values: &str,
+    start: Option<usize>,
+    stop: Option<usize>,
+    stride: Option<usize>,
+) -> PyResult<System> {
+    let (definitions, values) = (definitions.to_string(), values.to_string());
+    py.allow_threads(move || {
+        let mut set = CoordinateSet::read(Path::new(&definitions), Some(Path::new(&values)))
+            .map_err(to_py_err)?;
+        if let Some(stop) = stop {
+            set.values.truncate(stop);
+        }
+        let start = start.unwrap_or(0);
+        let stride = stride.unwrap_or(1);
+        let one_d_data = set
+            .columns(start, stride)
+            .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+        let mean_log_jacobian = set.log_jacobian().ok().map(|log_jacobian| {
+            let selected: Vec<f64> = log_jacobian
+                .into_iter()
+                .skip(start)
+                .step_by(stride)
+                .collect();
+            selected.iter().sum::<f64>() / selected.len() as f64
+        });
+        let frames = one_d_data[0].len();
+        let metrics = set.coordinate_metrics();
+        set.values = Vec::new();
+        Ok(System {
+            one_d_data,
+            frames,
+            metrics,
+            mean_log_jacobian,
+            set,
+        })
+    })
+}
+
 // Python keyword arguments, so the count is set by the public signature.
 #[allow(clippy::too_many_arguments)]
-#[pyfunction(signature = (top_path, traj_path, start=None, stop=None, torsions_only=None, stride=None, tree_bonds=false, phase_angles=true, drop_constrained=false))]
+#[pyfunction(signature = (top_path, traj_path, start=None, stop=None, torsions_only=None, stride=None, tree_bonds=false, phase_angles=true, bonds=None, tree=None, drop_constrained=false))]
 fn load_system(
     py: Python<'_>,
     top_path: &str,
@@ -796,14 +914,39 @@ fn load_system(
     stride: Option<usize>,
     tree_bonds: bool,
     phase_angles: bool,
+    bonds: Option<&str>,
+    tree: Option<&str>,
     drop_constrained: bool,
 ) -> PyResult<System> {
+    let tree = match tree {
+        None | Some("mass") => TreeRule::MassOrdered,
+        Some("canonical") => TreeRule::Canonical,
+        Some(other) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "tree must be 'mass' or 'canonical', got {other:?}"
+            )));
+        }
+    };
+    let bonds = match bonds {
+        None if tree_bonds => BondSet::Tree,
+        None => BondSet::HeavyAtom,
+        Some(_) if tree_bonds => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "tree_bonds=True is shorthand for bonds='tree'; pass one or the other",
+            ));
+        }
+        Some("heavy") => BondSet::HeavyAtom,
+        Some("tree") => BondSet::Tree,
+        Some("tree-unconstrained") => BondSet::TreeUnconstrained,
+        Some(other) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "bonds must be 'heavy', 'tree' or 'tree-unconstrained', got {other:?}"
+            )));
+        }
+    };
     let options = CoordinateOptions {
-        bonds: if tree_bonds {
-            BondSet::Tree
-        } else {
-            BondSet::HeavyAtom
-        },
+        bonds,
+        tree,
         phase_angles,
         drop_constrained,
         ..Default::default()
@@ -899,7 +1042,7 @@ fn estimate_coordinate_mutual_information(
 /// `periodic_correlation="centered"`.
 // Python keyword arguments, so the count is set by the public signature.
 #[allow(clippy::too_many_arguments)]
-#[pyfunction(signature = (data, periods=None, periodic=true, histogram_bins=None, periodic_correlation="complex", exact_constant=false, theiler_window=0))]
+#[pyfunction(signature = (data, periods=None, periodic=true, histogram_bins=None, periodic_correlation="complex", bias="none", effective_frames=None, exact_constant=false, theiler_window=0))]
 fn estimate_quasi_harmonic_entropy(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
@@ -907,6 +1050,8 @@ fn estimate_quasi_harmonic_entropy(
     periodic: bool,
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
     exact_constant: bool,
     theiler_window: usize,
 ) -> PyResult<HashMap<&'static str, f64>> {
@@ -918,6 +1063,8 @@ fn estimate_quasi_harmonic_entropy(
             &metrics,
             histogram_bins,
             periodic_correlation,
+            bias,
+            effective_frames,
             exact_constant,
             theiler_window,
         )
@@ -929,7 +1076,7 @@ fn estimate_quasi_harmonic_entropy(
 /// matching total; the correlation term is shared out as 1/2 (log C)_ii.
 // Python keyword arguments, so the count is set by the public signature.
 #[allow(clippy::too_many_arguments)]
-#[pyfunction(signature = (data, periods=None, periodic=true, histogram_bins=None, periodic_correlation="complex", exact_constant=false, theiler_window=0))]
+#[pyfunction(signature = (data, periods=None, periodic=true, histogram_bins=None, periodic_correlation="complex", bias="none", effective_frames=None, exact_constant=false, theiler_window=0))]
 fn estimate_coordinate_quasi_harmonic_entropy(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
@@ -937,6 +1084,8 @@ fn estimate_coordinate_quasi_harmonic_entropy(
     periodic: bool,
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
     exact_constant: bool,
     theiler_window: usize,
 ) -> PyResult<HashMap<&'static str, Vec<f64>>> {
@@ -948,6 +1097,8 @@ fn estimate_coordinate_quasi_harmonic_entropy(
             &metrics,
             histogram_bins,
             periodic_correlation,
+            bias,
+            effective_frames,
             exact_constant,
             theiler_window,
         )
@@ -961,7 +1112,7 @@ fn estimate_coordinate_quasi_harmonic_entropy(
 /// "detect", or a list of coordinate indices from 0; None means "topology"
 /// for a System and "detect" for an array.
 #[allow(clippy::too_many_arguments)]
-#[pyfunction(signature = (data, soft=None, soft_estimator="mie", mie_order=2, hard_estimator="qh", coupling="gaussian", soft_features="harmonics", harmonics=None, state_coordinates=None, state_labels=None, min_state_frames=300, histogram_bins=None, periodic_correlation="centered", periods=None, periodic=true, exact_constant=false, theiler_window=0, per_coordinate=false, network_parents=5))]
+#[pyfunction(signature = (data, soft=None, soft_estimator="mie", mie_order=2, hard_estimator="qh", coupling="gaussian", soft_features="harmonics", harmonics=None, state_coordinates=None, state_labels=None, min_state_frames=300, histogram_bins=None, periodic_correlation="centered", bias="none", effective_frames=None, periods=None, periodic=true, exact_constant=false, theiler_window=0, per_coordinate=false, network_parents=5))]
 fn estimate_split_entropy(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
@@ -977,6 +1128,8 @@ fn estimate_split_entropy(
     min_state_frames: usize,
     histogram_bins: Option<usize>,
     periodic_correlation: &str,
+    bias: &str,
+    effective_frames: Option<f64>,
     periods: Option<Vec<Option<f64>>>,
     periodic: bool,
     exact_constant: bool,
@@ -1004,6 +1157,8 @@ fn estimate_split_entropy(
             min_state_frames,
             histogram_bins,
             periodic_correlation,
+            bias,
+            effective_frames,
             periodic,
             exact_constant,
             theiler_window,
@@ -1024,6 +1179,8 @@ fn estimate_split_entropy(
         min_state_frames,
         histogram_bins,
         periodic_correlation,
+        bias,
+        effective_frames,
         network_parents,
     )?;
     let (one_d_data, frames_end, metrics) = one_d_data_from_py(data, periods, periodic)?;
@@ -1080,6 +1237,7 @@ fn detect_basins(
 fn molentropy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<System>()?;
     m.add_function(wrap_pyfunction!(load_system, m)?)?;
+    m.add_function(wrap_pyfunction!(load_coordinates, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_entropy, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_coordinate_entropy, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_coordinate_mutual_information, m)?)?;
